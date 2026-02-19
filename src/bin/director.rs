@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
-    SessionState, SourceContext, TimeoutPolicy,
+    SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
@@ -592,6 +592,45 @@ fn normalize_source_name(source: &str) -> Result<String, DirectorError> {
     }
 }
 
+async fn resolve_source_context(
+    client: &JulesClient,
+    source_name: &str,
+) -> Result<SourceContext, DirectorError> {
+    let source = client.get_source(source_name).await?;
+    let github_repo_context = derive_github_repo_context(&source)?;
+    Ok(SourceContext {
+        source: source.name,
+        github_repo_context,
+    })
+}
+
+fn derive_github_repo_context(
+    source: &Source,
+) -> Result<Option<SessionGithubRepoContext>, DirectorError> {
+    let Some(github_repo) = source.github_repo.as_ref() else {
+        return Ok(None);
+    };
+
+    let starting_branch = github_repo
+        .default_branch
+        .as_ref()
+        .map(|branch| branch.display_name.clone())
+        .or_else(|| {
+            github_repo
+                .branches
+                .first()
+                .map(|branch| branch.display_name.clone())
+        })
+        .ok_or_else(|| {
+            DirectorError::InvalidState(format!(
+                "source `{}` does not expose a usable default branch",
+                source.name
+            ))
+        })?;
+
+    Ok(Some(SessionGithubRepoContext { starting_branch }))
+}
+
 fn ensure_state(
     state_path: &Path,
     goal: Option<String>,
@@ -754,15 +793,12 @@ async fn create_session_for_task(
         build_task_prompt(state, task)
     };
     let title = format!("director: {}", state.tasks[task_index].title);
-    let source = state.source.clone();
+    let source_context = resolve_source_context(client, &state.source).await?;
     let session = client
         .create_session(CreateSessionRequest {
             prompt,
             title: Some(title),
-            source_context: Some(SourceContext {
-                source,
-                github_repo_context: None,
-            }),
+            source_context: Some(source_context),
             require_plan_approval: Some(false),
             automation_mode: Some(AutomationMode::AutoCreatePr),
         })
@@ -1147,6 +1183,7 @@ fn save_state(state_path: &Path, state: &DirectorState) -> Result<(), DirectorEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jules_rs::{Branch, GithubRepoContext};
 
     #[test]
     fn build_seed_tasks_creates_multiple_pending_tasks() {
@@ -1238,6 +1275,59 @@ mod tests {
                 source: None,
                 max_cycles: DEFAULT_MAX_CYCLES
             }
+        );
+    }
+
+    #[test]
+    fn derive_github_repo_context_prefers_default_branch() {
+        let source = Source {
+            name: "sources/github/acme/widgets".to_string(),
+            id: None,
+            display_name: None,
+            description: None,
+            github_repo: Some(GithubRepoContext {
+                owner: "acme".to_string(),
+                repo: "widgets".to_string(),
+                is_private: None,
+                default_branch: Some(Branch {
+                    display_name: "main".to_string(),
+                }),
+                branches: vec![Branch {
+                    display_name: "develop".to_string(),
+                }],
+            }),
+        };
+
+        let github_context =
+            derive_github_repo_context(&source).expect("github repo context should resolve");
+        assert_eq!(
+            github_context,
+            Some(SessionGithubRepoContext {
+                starting_branch: "main".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn derive_github_repo_context_errors_when_no_branches_exist() {
+        let source = Source {
+            name: "sources/github/acme/widgets".to_string(),
+            id: None,
+            display_name: None,
+            description: None,
+            github_repo: Some(GithubRepoContext {
+                owner: "acme".to_string(),
+                repo: "widgets".to_string(),
+                is_private: None,
+                default_branch: None,
+                branches: vec![],
+            }),
+        };
+
+        let error = derive_github_repo_context(&source).expect_err("expected missing branch error");
+        assert!(
+            matches!(error, DirectorError::InvalidState(_)),
+            "missing branch must map to invalid state"
         );
     }
 }
