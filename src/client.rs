@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 use std::{fmt, fmt::Formatter};
 
@@ -10,7 +11,7 @@ use crate::error::{ApiError, JulesError};
 use crate::types::{
     CreateSessionRequest, ListActivitiesParams, ListActivitiesResponse, ListSessionsParams,
     ListSessionsResponse, ListSourcesParams, ListSourcesResponse, SendMessageRequest, Session,
-    Source,
+    SessionState, Source,
 };
 
 const DEFAULT_BASE_URL: &str = "https://jules.googleapis.com/v1alpha/";
@@ -151,6 +152,52 @@ impl JulesClient {
         let url = self.endpoint(&format!("sessions/{session_id}"))?;
         let request = self.authorized(self.http_client.delete(url));
         self.send_empty(request, RetryBehavior::Idempotent).await
+    }
+
+    /// Deletes all sessions currently in the `COMPLETED` state.
+    ///
+    /// Returns the resource names for sessions that were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JulesError`] if listing pages fails, a deletion fails, or
+    /// transport/API errors occur.
+    pub async fn delete_completed_sessions(&self) -> Result<Vec<String>, JulesError> {
+        let mut deleted_sessions = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = HashSet::new();
+
+        loop {
+            let response = self
+                .list_sessions(ListSessionsParams {
+                    page_size: Some(MAX_PAGE_SIZE),
+                    page_token,
+                    filter: None,
+                })
+                .await?;
+
+            for session in response.sessions {
+                if session.state == Some(SessionState::Completed) {
+                    let session_name = session.name;
+                    self.delete_session(&session_name).await?;
+                    deleted_sessions.push(session_name);
+                }
+            }
+
+            match response.next_page_token.filter(|token| !token.is_empty()) {
+                Some(next_page_token) => {
+                    if !seen_page_tokens.insert(next_page_token.clone()) {
+                        return Err(JulesError::InvalidArgument(format!(
+                            "duplicate next_page_token returned by API: `{next_page_token}`"
+                        )));
+                    }
+                    page_token = Some(next_page_token);
+                }
+                None => break,
+            }
+        }
+
+        Ok(deleted_sessions)
     }
 
     /// Sends a follow-up message prompt to a session.

@@ -4,7 +4,7 @@ use jules_rs::{
 };
 use serde_json::json;
 use std::time::Duration;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -370,4 +370,169 @@ async fn debug_output_redacts_api_key_for_builder_and_client() {
         !client_debug.contains("super-secret-api-key"),
         "client debug output must not leak api key"
     );
+}
+
+#[tokio::test]
+async fn delete_completed_sessions_deletes_only_completed_across_pages() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-1",
+                    "state": "COMPLETED"
+                },
+                {
+                    "name": "sessions/s-2",
+                    "state": "IN_PROGRESS"
+                }
+            ],
+            "nextPageToken": "cursor-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param("pageToken", "cursor-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-3",
+                    "state": "COMPLETED"
+                },
+                {
+                    "name": "sessions/s-4",
+                    "state": "FAILED"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1alpha/sessions/s-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1alpha/sessions/s-3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = JulesClient::builder("test-api-key")
+        .base_url(format!("{}/v1alpha", server.uri()))
+        .build()
+        .expect("build test client");
+
+    let deleted_sessions = client
+        .delete_completed_sessions()
+        .await
+        .expect("delete completed sessions succeeds");
+
+    assert_eq!(
+        deleted_sessions,
+        vec!["sessions/s-1".to_string(), "sessions/s-3".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn delete_completed_sessions_returns_empty_when_no_completed() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-1",
+                    "state": "IN_PROGRESS"
+                },
+                {
+                    "name": "sessions/s-2",
+                    "state": "FAILED"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = JulesClient::builder("test-api-key")
+        .base_url(format!("{}/v1alpha", server.uri()))
+        .build()
+        .expect("build test client");
+
+    let deleted_sessions = client
+        .delete_completed_sessions()
+        .await
+        .expect("delete completed sessions succeeds");
+    assert!(deleted_sessions.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("read received requests");
+    assert_eq!(requests.len(), 1, "only listing call should be issued");
+}
+
+#[tokio::test]
+async fn delete_completed_sessions_rejects_duplicate_next_page_token() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [],
+            "nextPageToken": "cursor-dup"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param("pageToken", "cursor-dup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [],
+            "nextPageToken": "cursor-dup"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = JulesClient::builder("test-api-key")
+        .base_url(format!("{}/v1alpha", server.uri()))
+        .build()
+        .expect("build test client");
+
+    let error = client
+        .delete_completed_sessions()
+        .await
+        .expect_err("expected duplicate token validation error");
+
+    match error {
+        JulesError::InvalidArgument(message) => {
+            assert!(
+                message.contains("duplicate next_page_token"),
+                "error message should mention duplicate token"
+            );
+        }
+        other => panic!("expected JulesError::InvalidArgument, got {other:?}"),
+    }
 }
