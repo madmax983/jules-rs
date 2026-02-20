@@ -19,8 +19,11 @@ fn temp_state_path() -> PathBuf {
     let mut path = env::temp_dir();
     let pid = std::process::id();
     // using a simple counter or random if possible, but pid + timestamp is usually enough
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    path.push(format!("director-test-{}-{}.json", pid, timestamp));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("director-test-{pid}-{timestamp}.json"));
     path
 }
 
@@ -94,7 +97,11 @@ fn lock_coordination_prevents_concurrent_runs() {
         .expect("failed to execute director");
 
     // Verify it failed with exit code 13
-    assert_eq!(output.status.code(), Some(13), "Director should fail with lock error (13) when lock is held");
+    assert_eq!(
+        output.status.code(),
+        Some(13),
+        "Director should fail with lock error (13) when lock is held"
+    );
 
     // Unlock
     lock_file.unlock().ok();
