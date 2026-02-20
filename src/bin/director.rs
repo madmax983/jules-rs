@@ -1,15 +1,23 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionState, SourceContext, TimeoutPolicy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
+
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_USAGE: i32 = 10;
+const EXIT_TRANSIENT: i32 = 11;
+const EXIT_PERMANENT: i32 = 12;
+const EXIT_LOCK: i32 = 13;
+const EXIT_INTERNAL: i32 = 14;
 
 const DEFAULT_STATE_FILE: &str = ".jules-director-state.json";
 const DEFAULT_MAX_CYCLES: u32 = 600;
@@ -29,6 +37,8 @@ enum DirectorError {
     MissingStateFile(String),
     #[error("invalid state: {0}")]
     InvalidState(String),
+    #[error("failed to acquire lock on `{0}`")]
+    Lock(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -37,10 +47,58 @@ enum DirectorError {
     Jules(#[from] JulesError),
 }
 
+impl DirectorError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            DirectorError::MissingApiKey => EXIT_USAGE,
+            DirectorError::Usage(_) => EXIT_USAGE,
+            DirectorError::MissingStateFile(_) => EXIT_USAGE,
+            DirectorError::InvalidState(_) => EXIT_PERMANENT,
+            DirectorError::Lock(_) => EXIT_LOCK,
+            DirectorError::Io(_) => EXIT_TRANSIENT,
+            DirectorError::Serde(_) => EXIT_INTERNAL, // State corruption
+            DirectorError::Jules(e) => match e {
+                JulesError::InvalidArgument(_) => EXIT_PERMANENT,
+                JulesError::Decode { .. } => EXIT_TRANSIENT, // Maybe API changed?
+                JulesError::Http(reqwest_err) => {
+                    if reqwest_err.is_timeout() || reqwest_err.is_connect() {
+                        EXIT_TRANSIENT
+                    } else if let Some(status) = reqwest_err.status() {
+                        if status.is_server_error() || status.as_u16() == 429 {
+                            EXIT_TRANSIENT
+                        } else {
+                            EXIT_PERMANENT
+                        }
+                    } else {
+                        EXIT_TRANSIENT
+                    }
+                }
+                JulesError::Api(api_err) => {
+                    let status = api_err.status_code;
+                    if (500..600).contains(&status) || status == 429 {
+                        EXIT_TRANSIENT
+                    } else {
+                        EXIT_PERMANENT
+                    }
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DirectorOutput {
+    schema_version: u32,
+    exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cli {
     mode: CommandMode,
     state_path: PathBuf,
+    json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,21 +347,69 @@ struct GateCommandResult {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), DirectorError> {
-    let cli = parse_cli(env::args().skip(1))?;
+async fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let json_mode = args.iter().any(|arg| arg == "--json");
+
+    match run_inner(args).await {
+        Ok(output) => {
+            if json_mode {
+                let response = DirectorOutput {
+                    schema_version: 1,
+                    exit_code: EXIT_SUCCESS,
+                    error: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&response).unwrap());
+            } else if let Some(msg) = output {
+                println!("{msg}");
+            }
+            ExitCode::from(EXIT_SUCCESS as u8)
+        }
+        Err(err) => {
+            let code = err.exit_code();
+            if json_mode {
+                let response = DirectorOutput {
+                    schema_version: 1,
+                    exit_code: code,
+                    error: Some(err.to_string()),
+                };
+                println!("{}", serde_json::to_string_pretty(&response).unwrap());
+            } else {
+                eprintln!("Error: {}", err);
+            }
+            ExitCode::from(code as u8)
+        }
+    }
+}
+
+async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
+    let cli = parse_cli(args)?;
+
+    let lock_path = PathBuf::from(format!("{}.lock", cli.state_path.display()));
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let lock_file = fs::File::create(&lock_path)?;
+    lock_file
+        .try_lock_exclusive()
+        .map_err(|_| DirectorError::Lock(lock_path.display().to_string()))?;
+
     match cli.mode {
         CommandMode::Init { goal, source } => {
             let source = normalize_source_name(&source)?;
             let state = bootstrap_state(goal, source, DirectorPolicy::from_env());
             save_state(&cli.state_path, &state)?;
-            println!("initialized director state at {}", cli.state_path.display());
-            print_status(&state);
-            Ok(())
+            Ok(Some(format!(
+                "initialized director state at {}\n{}",
+                cli.state_path.display(),
+                format_status(&state)
+            )))
         }
         CommandMode::Status => {
             let state = load_state(&cli.state_path)?;
-            print_status(&state);
-            Ok(())
+            Ok(Some(format_status(&state)))
         }
         CommandMode::Tick => {
             let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
@@ -313,9 +419,11 @@ async fn main() -> Result<(), DirectorError> {
             let outcome = tick_once(&client, &mut state, &workspace_root).await?;
             state.updated_at_unix = now_unix();
             save_state(&cli.state_path, &state)?;
-            println!("{}", outcome.summary());
-            print_status_counts(&state);
-            Ok(())
+            Ok(Some(format!(
+                "{}\n{}",
+                outcome.summary(),
+                format_status_counts(&state)
+            )))
         }
         CommandMode::Run {
             goal,
@@ -333,7 +441,8 @@ async fn main() -> Result<(), DirectorError> {
                 max_cycles,
                 &workspace_root,
             )
-            .await
+            .await?;
+            Ok(None)
         }
     }
 }
@@ -346,6 +455,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
 
     let mut state_path = default_state_path();
     let mut max_cycles = DEFAULT_MAX_CYCLES;
+    let mut json = false;
     let mut positional = Vec::new();
     let mut index = 0_usize;
     while index < raw_args.len() {
@@ -368,6 +478,10 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
                     ))
                 })?;
                 index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
             }
             _ if token.starts_with("--") => {
                 return Err(DirectorError::Usage(format!("unknown option `{token}`")));
@@ -432,15 +546,19 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         _ => return Err(DirectorError::Usage(usage().to_string())),
     };
 
-    Ok(Cli { mode, state_path })
+    Ok(Cli {
+        mode,
+        state_path,
+        json,
+    })
 }
 
 fn usage() -> &'static str {
     "director usage:
-  director init \"<goal>\" \"<source>\" [--state <path>]
-  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>]
-  director tick [--state <path>]
-  director status [--state <path>]"
+  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
+  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
+  director tick [--state <path>] [--json]
+  director status [--state <path>] [--json]"
 }
 
 fn default_state_path() -> PathBuf {
@@ -584,12 +702,12 @@ async fn run_until_settled(
         let outcome = tick_once(client, state, workspace_root).await?;
         state.updated_at_unix = now_unix();
         save_state(state_path, state)?;
-        println!("cycle {cycle}: {}", outcome.summary());
-        print_status_counts(state);
+        eprintln!("cycle {cycle}: {}", outcome.summary());
+        eprintln!("{}", format_status_counts(state));
 
         if all_tasks_terminal(state) {
-            println!("all tasks reached terminal status");
-            print_status(state);
+            eprintln!("all tasks reached terminal status");
+            eprintln!("{}", format_status(state));
             return Ok(());
         }
 
@@ -939,26 +1057,29 @@ Execution policy:
     )
 }
 
-fn print_status(state: &DirectorState) {
-    println!("goal: {}", state.product_goal);
-    println!("source: {}", state.source);
-    println!("state file version: {}", state.version);
-    print_status_counts(state);
+fn format_status(state: &DirectorState) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("goal: {}\n", state.product_goal));
+    output.push_str(&format!("source: {}\n", state.source));
+    output.push_str(&format!("state file version: {}\n", state.version));
+    output.push_str(&format_status_counts(state));
+    output.push('\n');
     for task in &state.tasks {
-        println!("[{:?}] {} ({})", task.status, task.title, task.id);
+        output.push_str(&format!("[{:?}] {} ({})\n", task.status, task.title, task.id));
         if let Some(session_name) = &task.session_name {
-            println!("  session: {session_name}");
+            output.push_str(&format!("  session: {session_name}\n"));
         }
         if let Some(pr_url) = &task.pr_url {
-            println!("  pr: {pr_url}");
+            output.push_str(&format!("  pr: {pr_url}\n"));
         }
         if let Some(last_error) = &task.last_error {
-            println!("  note: {last_error}");
+            output.push_str(&format!("  note: {last_error}\n"));
         }
     }
+    output.trim_end().to_string()
 }
 
-fn print_status_counts(state: &DirectorState) {
+fn format_status_counts(state: &DirectorState) -> String {
     let pending = state
         .tasks
         .iter()
@@ -979,9 +1100,9 @@ fn print_status_counts(state: &DirectorState) {
         .iter()
         .filter(|task| matches!(task.status, TaskStatus::Blocked | TaskStatus::Failed))
         .count();
-    println!(
+    format!(
         "counts: pending={pending} running={running} completed_or_pr={completed_like} blocked_or_failed={blocked}"
-    );
+    )
 }
 
 fn all_tasks_terminal(state: &DirectorState) -> bool {
