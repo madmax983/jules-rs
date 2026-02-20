@@ -567,7 +567,7 @@ fn default_state_path() -> PathBuf {
 }
 
 fn build_client(api_key: String) -> Result<JulesClient, DirectorError> {
-    JulesClient::builder(api_key)
+    let mut builder = JulesClient::builder(api_key)
         .retry_policy(RetryPolicy {
             max_retries: 3,
             initial_backoff: Duration::from_millis(300),
@@ -575,9 +575,13 @@ fn build_client(api_key: String) -> Result<JulesClient, DirectorError> {
         })
         .timeout_policy(TimeoutPolicy {
             request_timeout: Duration::from_secs(45),
-        })
-        .build()
-        .map_err(DirectorError::from)
+        });
+
+    if let Ok(base_url) = env::var("JULES_API_URL") {
+        builder = builder.base_url(base_url);
+    }
+
+    builder.build().map_err(DirectorError::from)
 }
 
 fn normalize_source_name(source: &str) -> Result<String, DirectorError> {
