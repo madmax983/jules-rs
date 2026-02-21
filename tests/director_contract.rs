@@ -21,8 +21,11 @@ fn director_exe() -> PathBuf {
 fn temp_state_path() -> PathBuf {
     let mut path = env::temp_dir();
     let pid = std::process::id();
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    path.push(format!("director-test-{}-{}.json", pid, timestamp));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("director-test-{pid}-{timestamp}.json"));
     path
 }
 
@@ -93,7 +96,11 @@ fn lock_coordination_prevents_concurrent_runs() {
         .output()
         .expect("failed to execute director");
 
-    assert_eq!(output.status.code(), Some(13), "Director should fail with lock error (13) when lock is held");
+    assert_eq!(
+        output.status.code(),
+        Some(13),
+        "Director should fail with lock error (13) when lock is held"
+    );
 
     lock_file.unlock().ok();
     fs::remove_file(&state_path).ok();
@@ -134,14 +141,22 @@ async fn tick_creates_session_for_pending_task() {
         .expect("tick failed");
 
     if output.status.code() != Some(0) {
-        eprintln!("Tick failed with stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "Tick failed with stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     assert_eq!(output.status.code(), Some(0));
 
     let state_content = fs::read_to_string(&state_path).expect("read state");
     let state_json: serde_json::Value = serde_json::from_str(&state_content).expect("parse state");
 
-    let task = state_json["tasks"].as_array().unwrap().iter().find(|t| t["id"] == "t-1").expect("find task t-1");
+    let task = state_json["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "t-1")
+        .expect("find task t-1");
     assert_eq!(task["status"], "RUNNING");
     assert_eq!(task["session_name"], "sessions/s-1");
 
@@ -163,9 +178,15 @@ async fn tick_updates_running_task_to_completed() {
         .expect("init failed");
 
     let state_content = fs::read_to_string(&state_path).expect("read state");
-    let mut state_json: serde_json::Value = serde_json::from_str(&state_content).expect("parse state");
+    let mut state_json: serde_json::Value =
+        serde_json::from_str(&state_content).expect("parse state");
 
-    if let Some(task) = state_json["tasks"].as_array_mut().unwrap().iter_mut().find(|t| t["id"] == "t-1") {
+    if let Some(task) = state_json["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["id"] == "t-1")
+    {
         task["status"] = json!("RUNNING");
         task["session_name"] = json!("sessions/s-1");
     }
@@ -196,14 +217,22 @@ async fn tick_updates_running_task_to_completed() {
         .expect("tick failed");
 
     if output.status.code() != Some(0) {
-        eprintln!("Tick failed with stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "Tick failed with stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     assert_eq!(output.status.code(), Some(0));
 
     let state_content = fs::read_to_string(&state_path).expect("read state");
     let state_json: serde_json::Value = serde_json::from_str(&state_content).expect("parse state");
 
-    let task = state_json["tasks"].as_array().unwrap().iter().find(|t| t["id"] == "t-1").expect("find task t-1");
+    let task = state_json["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "t-1")
+        .expect("find task t-1");
     assert_eq!(task["status"], "PR_CANDIDATE");
     assert_eq!(task["pr_url"], "https://github.com/owner/repo/pull/123");
 
