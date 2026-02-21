@@ -50,9 +50,9 @@ enum DirectorError {
 impl DirectorError {
     fn exit_code(&self) -> i32 {
         match self {
-            DirectorError::MissingApiKey => EXIT_USAGE,
-            DirectorError::Usage(_) => EXIT_USAGE,
-            DirectorError::MissingStateFile(_) => EXIT_USAGE,
+            DirectorError::MissingApiKey
+            | DirectorError::Usage(_)
+            | DirectorError::MissingStateFile(_) => EXIT_USAGE,
             DirectorError::InvalidState(_) => EXIT_PERMANENT,
             DirectorError::Lock(_) => EXIT_LOCK,
             DirectorError::Io(_) => EXIT_TRANSIENT,
@@ -363,7 +363,7 @@ async fn main() -> ExitCode {
             } else if let Some(msg) = output {
                 println!("{msg}");
             }
-            ExitCode::from(EXIT_SUCCESS as u8)
+            ExitCode::from(u8::try_from(EXIT_SUCCESS).unwrap_or(1))
         }
         Err(err) => {
             let code = err.exit_code();
@@ -375,9 +375,9 @@ async fn main() -> ExitCode {
                 };
                 println!("{}", serde_json::to_string_pretty(&response).unwrap());
             } else {
-                eprintln!("Error: {}", err);
+                eprintln!("Error: {err}");
             }
-            ExitCode::from(code as u8)
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
     }
 }
@@ -399,7 +399,7 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
     match cli.mode {
         CommandMode::Init { goal, source } => {
             let source = normalize_source_name(&source)?;
-            let state = bootstrap_state(goal, source, DirectorPolicy::from_env());
+            let state = bootstrap_state(&goal, source, DirectorPolicy::from_env());
             save_state(&cli.state_path, &state)?;
             Ok(Some(format!(
                 "initialized director state at {}\n{}",
@@ -675,21 +675,21 @@ fn ensure_state(
         )
     })?;
     let normalized_source = normalize_source_name(&source)?;
-    let state = bootstrap_state(goal, normalized_source, DirectorPolicy::from_env());
+    let state = bootstrap_state(&goal, normalized_source, DirectorPolicy::from_env());
     save_state(state_path, &state)?;
     Ok(state)
 }
 
-fn bootstrap_state(goal: String, source: String, policy: DirectorPolicy) -> DirectorState {
+fn bootstrap_state(goal: &str, source: String, policy: DirectorPolicy) -> DirectorState {
     let now = now_unix();
     DirectorState {
         version: 1,
-        product_goal: goal.clone(),
+        product_goal: goal.to_string(),
         source,
         created_at_unix: now,
         updated_at_unix: now,
         policy,
-        tasks: build_seed_tasks(&goal),
+        tasks: build_seed_tasks(goal),
     }
 }
 
@@ -817,7 +817,7 @@ async fn create_session_for_task(
     task.plan_approved = false;
     task.feedback_messages_sent = 0;
     task.session_name = Some(session.name.clone());
-    task.session_url = session.url.clone();
+    task.session_url.clone_from(&session.url);
     task.last_session_state = session.state;
     task.last_error = None;
 
@@ -856,7 +856,7 @@ async fn poll_running_task(
         task.poll_attempts = task.poll_attempts.saturating_add(1);
         task.last_session_state = Some(session_state);
         if task.session_url.is_none() {
-            task.session_url = session.url.clone();
+            task.session_url.clone_from(&session.url);
         }
     }
 
@@ -950,7 +950,7 @@ fn complete_task_from_session(
     if gate_failures.is_empty() {
         let task = &mut state.tasks[task_index];
         task.commit_hash = commit_hash;
-        task.pr_url = pr_url.clone();
+        task.pr_url.clone_from(&pr_url);
         task.status = if pr_url.is_some() {
             TaskStatus::PrCandidate
         } else {
@@ -1100,22 +1100,22 @@ Execution policy:
 }
 
 fn format_status(state: &DirectorState) -> String {
+    use std::fmt::Write;
     let mut output = String::new();
-    output.push_str(&format!("goal: {}\n", state.product_goal));
-    output.push_str(&format!("source: {}\n", state.source));
-    output.push_str(&format!("state file version: {}\n", state.version));
-    output.push_str(&format_status_counts(state));
-    output.push('\n');
+    let _ = writeln!(output, "goal: {}", state.product_goal);
+    let _ = writeln!(output, "source: {}", state.source);
+    let _ = writeln!(output, "state file version: {}", state.version);
+    let _ = writeln!(output, "{}", format_status_counts(state));
     for task in &state.tasks {
-        output.push_str(&format!("[{:?}] {} ({})\n", task.status, task.title, task.id));
+        let _ = writeln!(output, "[{:?}] {} ({})", task.status, task.title, task.id);
         if let Some(session_name) = &task.session_name {
-            output.push_str(&format!("  session: {session_name}\n"));
+            let _ = writeln!(output, "  session: {session_name}");
         }
         if let Some(pr_url) = &task.pr_url {
-            output.push_str(&format!("  pr: {pr_url}\n"));
+            let _ = writeln!(output, "  pr: {pr_url}");
         }
         if let Some(last_error) = &task.last_error {
-            output.push_str(&format!("  note: {last_error}\n"));
+            let _ = writeln!(output, "  note: {last_error}");
         }
     }
     output.trim_end().to_string()
