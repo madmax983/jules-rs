@@ -112,6 +112,19 @@ async fn tick_creates_session_for_pending_task() {
     let server = MockServer::start().await;
     let state_path = temp_state_path();
 
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sources/source"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "sources/source",
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": { "displayName": "main" }
+            }
+        })))
+        .mount(&server)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/v1alpha/sessions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -243,6 +256,19 @@ async fn tick_updates_running_task_to_completed() {
 async fn tick_handles_api_errors_gracefully() {
     let server = MockServer::start().await;
     let state_path = temp_state_path();
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sources/source"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "sources/source",
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": { "displayName": "main" }
+            }
+        })))
+        .mount(&server)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/v1alpha/sessions"))
