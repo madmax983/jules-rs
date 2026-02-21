@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[features]
+visualizer = []
+
 [dependencies]
 fs2 = "0.4.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
