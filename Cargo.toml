@@ -6,6 +6,7 @@ rust-version = "1.85"
 
 [features]
 visualizer = []
+analytics = []
 
 [dependencies]
 fs2 = "0.4.3"
