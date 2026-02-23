@@ -9,6 +9,8 @@ use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
 };
+#[cfg(feature = "report")]
+use jules_rs::{ListActivitiesParams, SessionHtmlReporter};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
@@ -114,6 +116,11 @@ enum CommandMode {
     },
     Tick,
     Status,
+    #[cfg(feature = "report")]
+    Export {
+        session_id: String,
+        output_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,6 +451,49 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             .await?;
             Ok(None)
         }
+        #[cfg(feature = "report")]
+        CommandMode::Export {
+            session_id,
+            output_path,
+        } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            // 1. Fetch Session
+            let session = client.get_session(&session_id).await?;
+
+            // 2. Fetch Activities (pagination)
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            // 3. Generate Report
+            let reporter = SessionHtmlReporter::new();
+            let html = reporter.generate_report(&session, &activities);
+
+            // 4. Write to file
+            fs::write(&output_path, html)?;
+            Ok(Some(format!(
+                "exported session report to `{}`",
+                output_path.display()
+            )))
+        }
     }
 }
 
@@ -455,6 +505,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
 
     let mut state_path = default_state_path();
     let mut max_cycles = DEFAULT_MAX_CYCLES;
+    #[cfg(feature = "report")]
+    let mut output_path_opt = None;
     let mut json = false;
     let mut positional = Vec::new();
     let mut index = 0_usize;
@@ -479,6 +531,14 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
                 })?;
                 index += 2;
             }
+            #[cfg(feature = "report")]
+            "--out" => {
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or_else(|| DirectorError::Usage("missing value for --out".to_string()))?;
+                output_path_opt = Some(PathBuf::from(value));
+                index += 2;
+            }
             "--json" => {
                 json = true;
                 index += 1;
@@ -498,35 +558,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
     }
 
     let mode = match positional[0].as_str() {
-        "init" => {
-            if positional.len() != 3 {
-                return Err(DirectorError::Usage(
-                    "init requires: init \"<goal>\" \"<source>\"".to_string(),
-                ));
-            }
-            CommandMode::Init {
-                goal: positional[1].clone(),
-                source: positional[2].clone(),
-            }
-        }
-        "run" => match positional.len() {
-            1 => CommandMode::Run {
-                goal: None,
-                source: None,
-                max_cycles,
-            },
-            3 => CommandMode::Run {
-                goal: Some(positional[1].clone()),
-                source: Some(positional[2].clone()),
-                max_cycles,
-            },
-            _ => {
-                return Err(DirectorError::Usage(
-                    "run supports either `run` (existing state) or `run \"<goal>\" \"<source>\"`"
-                        .to_string(),
-                ));
-            }
-        },
+        "init" => parse_init_mode(&positional)?,
+        "run" => parse_run_mode(&positional, max_cycles)?,
         "tick" => {
             if positional.len() != 1 {
                 return Err(DirectorError::Usage(
@@ -543,6 +576,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
             }
             CommandMode::Status
         }
+        #[cfg(feature = "report")]
+        "export" => parse_export_mode(&positional, output_path_opt)?,
         _ => return Err(DirectorError::Usage(usage().to_string())),
     };
 
@@ -553,12 +588,79 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
     })
 }
 
+fn parse_init_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 3 {
+        return Err(DirectorError::Usage(
+            "init requires: init \"<goal>\" \"<source>\"".to_string(),
+        ));
+    }
+    Ok(CommandMode::Init {
+        goal: positional[1].clone(),
+        source: positional[2].clone(),
+    })
+}
+
+fn parse_run_mode(positional: &[String], max_cycles: u32) -> Result<CommandMode, DirectorError> {
+    match positional.len() {
+        1 => Ok(CommandMode::Run {
+            goal: None,
+            source: None,
+            max_cycles,
+        }),
+        3 => Ok(CommandMode::Run {
+            goal: Some(positional[1].clone()),
+            source: Some(positional[2].clone()),
+            max_cycles,
+        }),
+        _ => Err(DirectorError::Usage(
+            "run supports either `run` (existing state) or `run \"<goal>\" \"<source>\"`"
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "report")]
+fn parse_export_mode(
+    positional: &[String],
+    output_path_opt: Option<PathBuf>,
+) -> Result<CommandMode, DirectorError> {
+    if positional.len() < 2 {
+        return Err(DirectorError::Usage(
+            "export requires: export <session_id> [--out <path>]".to_string(),
+        ));
+    }
+    let session_id = positional[1].clone();
+    // Use --out if provided, else default to {session_id}.html
+    let output_path = output_path_opt.unwrap_or_else(|| {
+        // If session_id contains slashes (e.g. sessions/123), sanitize for filename
+        let safe_name = session_id.replace('/', "_");
+        PathBuf::from(format!("{safe_name}.html"))
+    });
+    Ok(CommandMode::Export {
+        session_id,
+        output_path,
+    })
+}
+
 fn usage() -> &'static str {
-    "director usage:
+    #[cfg(feature = "report")]
+    {
+        "director usage:
+  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
+  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
+  director tick [--state <path>] [--json]
+  director status [--state <path>] [--json]
+  director export <session_id> [--out <path>] [--json]"
+    }
+
+    #[cfg(not(feature = "report"))]
+    {
+        "director usage:
   director init \"<goal>\" \"<source>\" [--state <path>] [--json]
   director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
   director tick [--state <path>] [--json]
   director status [--state <path>] [--json]"
+    }
 }
 
 fn default_state_path() -> PathBuf {
