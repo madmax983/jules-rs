@@ -11,6 +11,9 @@ mod analytics;
 #[cfg(feature = "visualizer")]
 mod visualizer;
 
+#[cfg(feature = "report")]
+mod html_report;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -22,3 +25,6 @@ pub use analytics::{SessionAnalyzer, SessionReport};
 
 #[cfg(feature = "visualizer")]
 pub use visualizer::SessionVisualizer;
+
+#[cfg(feature = "report")]
+pub use html_report::SessionHtmlReporter;
