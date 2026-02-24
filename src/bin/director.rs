@@ -5,12 +5,16 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+#[cfg(any(feature = "report", feature = "narrator"))]
+use jules_rs::ListActivitiesParams;
+#[cfg(feature = "report")]
+use jules_rs::SessionHtmlReporter;
+#[cfg(feature = "narrator")]
+use jules_rs::SessionNarrator;
 use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
 };
-#[cfg(feature = "report")]
-use jules_rs::{ListActivitiesParams, SessionHtmlReporter};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
@@ -120,6 +124,10 @@ enum CommandMode {
     Export {
         session_id: String,
         output_path: PathBuf,
+    },
+    #[cfg(feature = "narrator")]
+    Story {
+        session_id: String,
     },
 }
 
@@ -494,6 +502,42 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
                 output_path.display()
             )))
         }
+        #[cfg(feature = "narrator")]
+        CommandMode::Story { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            // 1. Fetch Session
+            let session = client.get_session(&session_id).await?;
+
+            // 2. Fetch Activities (pagination)
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            // 3. Generate Story
+            let narrator = SessionNarrator::new();
+            let story = narrator.narrate(&session, &activities);
+
+            // 4. Output to stdout
+            Ok(Some(format!("{story}")))
+        }
     }
 }
 
@@ -578,6 +622,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         }
         #[cfg(feature = "report")]
         "export" => parse_export_mode(&positional, output_path_opt)?,
+        #[cfg(feature = "narrator")]
+        "story" => parse_story_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage().to_string())),
     };
 
@@ -642,8 +688,31 @@ fn parse_export_mode(
     })
 }
 
+#[cfg(feature = "narrator")]
+fn parse_story_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "story requires: story <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Story {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> &'static str {
-    #[cfg(feature = "report")]
+    #[cfg(all(feature = "report", feature = "narrator"))]
+    {
+        "director usage:
+  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
+  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
+  director tick [--state <path>] [--json]
+  director status [--state <path>] [--json]
+  director export <session_id> [--out <path>] [--json]
+  director story <session_id> [--json]"
+    }
+
+    #[cfg(all(feature = "report", not(feature = "narrator")))]
     {
         "director usage:
   director init \"<goal>\" \"<source>\" [--state <path>] [--json]
@@ -653,7 +722,17 @@ fn usage() -> &'static str {
   director export <session_id> [--out <path>] [--json]"
     }
 
-    #[cfg(not(feature = "report"))]
+    #[cfg(all(not(feature = "report"), feature = "narrator"))]
+    {
+        "director usage:
+  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
+  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
+  director tick [--state <path>] [--json]
+  director status [--state <path>] [--json]
+  director story <session_id> [--json]"
+    }
+
+    #[cfg(not(any(feature = "report", feature = "narrator")))]
     {
         "director usage:
   director init \"<goal>\" \"<source>\" [--state <path>] [--json]
