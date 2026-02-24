@@ -9,6 +9,7 @@ visualizer = []
 analytics = []
 report = ["visualizer", "analytics"]
 tui = ["dep:ratatui", "dep:crossterm"]
+player = ["dep:crossterm"]
 
 [dependencies]
 fs2 = "0.4.3"
@@ -32,6 +33,11 @@ path = "src/bin/director.rs"
 name = "jules-monitor"
 path = "src/bin/monitor.rs"
 required-features = ["tui"]
+
+[[bin]]
+name = "jules-player"
+path = "src/bin/player.rs"
+required-features = ["player"]
 
 [lints.rust]
 unsafe_code = "warn"
