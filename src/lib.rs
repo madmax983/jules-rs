@@ -20,6 +20,9 @@ mod narrator;
 #[cfg(feature = "player")]
 mod player;
 
+#[cfg(feature = "doctor")]
+mod doctor;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -40,3 +43,6 @@ pub use narrator::{SessionNarrator, Story};
 
 #[cfg(feature = "player")]
 pub use player::SessionPlayer;
+
+#[cfg(feature = "doctor")]
+pub use doctor::{Diagnosis, DiagnosisLevel, SessionDoctor};

@@ -11,6 +11,7 @@ report = ["visualizer", "analytics"]
 narrator = []
 tui = ["dep:ratatui", "dep:crossterm"]
 player = ["dep:crossterm"]
+doctor = []
 
 [dependencies]
 fs2 = "0.4.3"
