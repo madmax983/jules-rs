@@ -17,6 +17,9 @@ mod html_report;
 #[cfg(feature = "player")]
 mod player;
 
+#[cfg(feature = "doctor")]
+mod doctor;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -34,3 +37,6 @@ pub use html_report::SessionHtmlReporter;
 
 #[cfg(feature = "player")]
 pub use player::SessionPlayer;
+
+#[cfg(feature = "doctor")]
+pub use doctor::{Diagnosis, DiagnosisLevel, SessionDoctor};
