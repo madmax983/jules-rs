@@ -14,6 +14,9 @@ mod visualizer;
 #[cfg(feature = "report")]
 mod html_report;
 
+#[cfg(feature = "narrator")]
+mod narrator;
+
 #[cfg(feature = "player")]
 mod player;
 
@@ -31,6 +34,9 @@ pub use visualizer::SessionVisualizer;
 
 #[cfg(feature = "report")]
 pub use html_report::SessionHtmlReporter;
+
+#[cfg(feature = "narrator")]
+pub use narrator::{SessionNarrator, Story};
 
 #[cfg(feature = "player")]
 pub use player::SessionPlayer;
