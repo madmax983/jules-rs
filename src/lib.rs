@@ -23,6 +23,9 @@ mod player;
 #[cfg(feature = "doctor")]
 mod doctor;
 
+#[cfg(feature = "scout")]
+mod scout;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -46,3 +49,6 @@ pub use player::SessionPlayer;
 
 #[cfg(feature = "doctor")]
 pub use doctor::{Diagnosis, DiagnosisLevel, SessionDoctor};
+
+#[cfg(feature = "scout")]
+pub use scout::ProjectScout;

@@ -112,6 +112,7 @@ impl SessionNarrator {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn create_chapter(&self, title: &str, activities: &[&Activity]) -> Chapter {
         let events = activities
             .iter()
@@ -123,6 +124,7 @@ impl SessionNarrator {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn create_event(&self, activity: &Activity) -> Event {
         let (description, sentiment) = if let Some(tool) = &activity.tool_use {
             (
