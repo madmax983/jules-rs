@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 #[cfg(any(feature = "report", feature = "narrator"))]
 use jules_rs::ListActivitiesParams;
+#[cfg(feature = "scout")]
+use jules_rs::ProjectScout;
 #[cfg(feature = "report")]
 use jules_rs::SessionHtmlReporter;
 #[cfg(feature = "narrator")]
@@ -128,6 +130,10 @@ enum CommandMode {
     #[cfg(feature = "narrator")]
     Story {
         session_id: String,
+    },
+    #[cfg(feature = "scout")]
+    Scout {
+        path: Option<PathBuf>,
     },
 }
 
@@ -397,6 +403,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
     let cli = parse_cli(args)?;
 
@@ -538,13 +545,21 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             // 4. Output to stdout
             Ok(Some(format!("{story}")))
         }
+        #[cfg(feature = "scout")]
+        CommandMode::Scout { path } => {
+            let target =
+                path.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let scout = ProjectScout::new();
+            let briefing = scout.scout(&target)?;
+            Ok(Some(format!("{briefing}")))
+        }
     }
 }
 
 fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorError> {
     let raw_args: Vec<String> = args.into_iter().collect();
     if raw_args.is_empty() {
-        return Err(DirectorError::Usage(usage().to_string()));
+        return Err(DirectorError::Usage(usage()));
     }
 
     let mut state_path = default_state_path();
@@ -598,7 +613,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
     }
 
     if positional.is_empty() {
-        return Err(DirectorError::Usage(usage().to_string()));
+        return Err(DirectorError::Usage(usage()));
     }
 
     let mode = match positional[0].as_str() {
@@ -624,7 +639,9 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "export" => parse_export_mode(&positional, output_path_opt)?,
         #[cfg(feature = "narrator")]
         "story" => parse_story_mode(&positional)?,
-        _ => return Err(DirectorError::Usage(usage().to_string())),
+        #[cfg(feature = "scout")]
+        "scout" => parse_scout_mode(&positional)?,
+        _ => return Err(DirectorError::Usage(usage())),
     };
 
     Ok(Cli {
@@ -700,46 +717,33 @@ fn parse_story_mode(positional: &[String]) -> Result<CommandMode, DirectorError>
     })
 }
 
-fn usage() -> &'static str {
-    #[cfg(all(feature = "report", feature = "narrator"))]
-    {
-        "director usage:
-  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
-  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
-  director tick [--state <path>] [--json]
-  director status [--state <path>] [--json]
-  director export <session_id> [--out <path>] [--json]
-  director story <session_id> [--json]"
-    }
+#[cfg(feature = "scout")]
+#[allow(clippy::unnecessary_wraps)]
+fn parse_scout_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    // director scout [path]
+    let path = positional.get(1).map(PathBuf::from);
+    Ok(CommandMode::Scout { path })
+}
 
-    #[cfg(all(feature = "report", not(feature = "narrator")))]
-    {
-        "director usage:
-  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
-  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
-  director tick [--state <path>] [--json]
-  director status [--state <path>] [--json]
-  director export <session_id> [--out <path>] [--json]"
-    }
+fn usage() -> String {
+    let mut usage = String::from("director usage:\n");
+    usage.push_str("  director init \"<goal>\" \"<source>\" [--state <path>] [--json]\n");
+    usage.push_str(
+        "  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]\n",
+    );
+    usage.push_str("  director tick [--state <path>] [--json]\n");
+    usage.push_str("  director status [--state <path>] [--json]");
 
-    #[cfg(all(not(feature = "report"), feature = "narrator"))]
-    {
-        "director usage:
-  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
-  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
-  director tick [--state <path>] [--json]
-  director status [--state <path>] [--json]
-  director story <session_id> [--json]"
-    }
+    #[cfg(feature = "report")]
+    usage.push_str("\n  director export <session_id> [--out <path>] [--json]");
 
-    #[cfg(not(any(feature = "report", feature = "narrator")))]
-    {
-        "director usage:
-  director init \"<goal>\" \"<source>\" [--state <path>] [--json]
-  director run [\"<goal>\" \"<source>\"] [--max-cycles <n>] [--state <path>] [--json]
-  director tick [--state <path>] [--json]
-  director status [--state <path>] [--json]"
-    }
+    #[cfg(feature = "narrator")]
+    usage.push_str("\n  director story <session_id> [--json]");
+
+    #[cfg(feature = "scout")]
+    usage.push_str("\n  director scout [path] [--json]");
+
+    usage
 }
 
 fn default_state_path() -> PathBuf {

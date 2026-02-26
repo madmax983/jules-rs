@@ -37,6 +37,7 @@ pub enum Sentiment {
     Heroic,
 }
 
+#[allow(clippy::unused_self)]
 impl SessionNarrator {
     /// Creates a new narrator.
     #[must_use]
