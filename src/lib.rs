@@ -26,6 +26,9 @@ mod doctor;
 #[cfg(feature = "scout")]
 mod scout;
 
+#[cfg(feature = "comparator")]
+mod comparator;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -52,3 +55,6 @@ pub use doctor::{Diagnosis, DiagnosisLevel, SessionDoctor};
 
 #[cfg(feature = "scout")]
 pub use scout::ProjectScout;
+
+#[cfg(feature = "comparator")]
+pub use comparator::{ComparisonReport, SessionComparator};

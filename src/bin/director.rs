@@ -5,12 +5,18 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-#[cfg(any(feature = "report", feature = "narrator"))]
+#[cfg(any(
+    feature = "report",
+    feature = "narrator",
+    feature = "comparator"
+))]
 use jules_rs::ListActivitiesParams;
 #[cfg(feature = "report")]
 use jules_rs::SessionHtmlReporter;
 #[cfg(feature = "narrator")]
 use jules_rs::SessionNarrator;
+#[cfg(feature = "comparator")]
+use jules_rs::SessionComparator;
 #[cfg(feature = "scout")]
 use jules_rs::ProjectScout;
 use jules_rs::{
@@ -130,6 +136,11 @@ enum CommandMode {
     #[cfg(feature = "narrator")]
     Story {
         session_id: String,
+    },
+    #[cfg(feature = "comparator")]
+    Compare {
+        session_a_id: String,
+        session_b_id: String,
     },
     #[cfg(feature = "scout")]
     Scout,
@@ -543,6 +554,64 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             // 4. Output to stdout
             Ok(Some(format!("{story}")))
         }
+        #[cfg(feature = "comparator")]
+        CommandMode::Compare {
+            session_a_id,
+            session_b_id,
+        } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            // Fetch Session A
+            let session_a = client.get_session(&session_a_id).await?;
+            let mut activities_a = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_a.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_a.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            // Fetch Session B
+            let session_b = client.get_session(&session_b_id).await?;
+            let mut activities_b = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_b.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_b.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            // Compare
+            let comparator = SessionComparator::new();
+            let report = comparator.compare(&session_a, &activities_a, &session_b, &activities_b);
+
+            Ok(Some(format!("{report}")))
+        }
         #[cfg(feature = "scout")]
         CommandMode::Scout => {
             let scout = ProjectScout::new();
@@ -636,6 +705,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "export" => parse_export_mode(&positional, output_path_opt)?,
         #[cfg(feature = "narrator")]
         "story" => parse_story_mode(&positional)?,
+        #[cfg(feature = "comparator")]
+        "compare" => parse_compare_mode(&positional)?,
         #[cfg(feature = "scout")]
         "scout" => {
             if positional.len() != 1 {
@@ -721,6 +792,19 @@ fn parse_story_mode(positional: &[String]) -> Result<CommandMode, DirectorError>
     })
 }
 
+#[cfg(feature = "comparator")]
+fn parse_compare_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 3 {
+        return Err(DirectorError::Usage(
+            "compare requires: compare <session_a_id> <session_b_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Compare {
+        session_a_id: positional[1].clone(),
+        session_b_id: positional[2].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from("director usage:
   director init \"<goal>\" \"<source>\" [--state <path>] [--json]
@@ -733,6 +817,9 @@ fn usage() -> String {
 
     #[cfg(feature = "narrator")]
     msg.push_str("\n  director story <session_id> [--json]");
+
+    #[cfg(feature = "comparator")]
+    msg.push_str("\n  director compare <session_a_id> <session_b_id> [--json]");
 
     #[cfg(feature = "scout")]
     msg.push_str("\n  director scout [--json]");
