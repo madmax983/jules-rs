@@ -118,7 +118,8 @@ mod tests {
     #[test]
     fn test_scout_scan() {
         // Create a temporary directory structure for testing
-        let temp_dir = std::env::temp_dir().join(format!("jules_scout_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("jules_scout_test_{}", std::process::id()));
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir).unwrap();
         }
