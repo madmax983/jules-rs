@@ -18,7 +18,7 @@ impl fmt::Display for DiagnosisLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
     pub level: DiagnosisLevel,
     pub message: String,
