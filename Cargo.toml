@@ -8,6 +8,7 @@ rust-version = "1.85"
 visualizer = []
 analytics = []
 report = ["visualizer", "analytics"]
+auditor = ["analytics", "doctor"]
 narrator = []
 tui = ["dep:ratatui", "dep:crossterm"]
 player = ["dep:crossterm"]
