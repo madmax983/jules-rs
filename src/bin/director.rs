@@ -5,7 +5,12 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-#[cfg(any(feature = "report", feature = "narrator", feature = "comparator"))]
+#[cfg(any(
+    feature = "report",
+    feature = "narrator",
+    feature = "comparator",
+    feature = "auditor"
+))]
 use jules_rs::ListActivitiesParams;
 #[cfg(feature = "scout")]
 use jules_rs::ProjectScout;
@@ -139,6 +144,10 @@ enum CommandMode {
     Compare {
         id_a: String,
         id_b: String,
+    },
+    #[cfg(feature = "auditor")]
+    Audit {
+        session_id: String,
     },
 }
 
@@ -610,6 +619,40 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             let report = comparator.compare(&session_a, &activities_a, &session_b, &activities_b);
             Ok(Some(format!("{report}")))
         }
+        #[cfg(feature = "auditor")]
+        CommandMode::Audit { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let auditor = jules_rs::SessionAuditor::new();
+            let report = auditor.audit(&session, &activities);
+            if cli.json {
+                Ok(Some(serde_json::to_string(&report)?))
+            } else {
+                Ok(Some(format!("{report:#?}")))
+            }
+        }
     }
 }
 
@@ -707,6 +750,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         }
         #[cfg(feature = "comparator")]
         "compare" => parse_compare_mode(&positional)?,
+        #[cfg(feature = "auditor")]
+        "audit" => parse_audit_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -796,6 +841,18 @@ fn parse_compare_mode(positional: &[String]) -> Result<CommandMode, DirectorErro
     })
 }
 
+#[cfg(feature = "auditor")]
+fn parse_audit_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "audit requires: audit <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Audit {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -816,6 +873,9 @@ fn usage() -> String {
 
     #[cfg(feature = "comparator")]
     msg.push_str("\n  director compare <session_id_a> <session_id_b> [--json]");
+
+    #[cfg(feature = "auditor")]
+    msg.push_str("\n  director audit <session_id> [--json]");
 
     msg
 }

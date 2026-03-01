@@ -1,7 +1,9 @@
 use crate::{Activity, ActivityStatus, Session};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DiagnosisLevel {
     Info,
     Warning,
@@ -18,7 +20,8 @@ impl fmt::Display for DiagnosisLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Diagnosis {
     pub level: DiagnosisLevel,
     pub message: String,

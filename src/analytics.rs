@@ -7,8 +7,11 @@ use crate::{Activity, Session};
 #[derive(Debug, Default)]
 pub struct SessionAnalyzer;
 
+use serde::{Deserialize, Serialize};
+
 /// Report containing aggregated metrics and insights from a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionReport {
     /// Total number of activities.
     pub total_activities: usize,
