@@ -9,7 +9,8 @@ use fs2::FileExt;
     feature = "report",
     feature = "narrator",
     feature = "comparator",
-    feature = "auditor"
+    feature = "auditor",
+    feature = "heatmap"
 ))]
 use jules_rs::ListActivitiesParams;
 #[cfg(feature = "scout")]
@@ -24,6 +25,8 @@ use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
 };
+#[cfg(feature = "heatmap")]
+use jules_rs::{ProjectHeatmap, SessionAnalyzer};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
@@ -147,6 +150,10 @@ enum CommandMode {
     },
     #[cfg(feature = "auditor")]
     Audit {
+        session_id: String,
+    },
+    #[cfg(feature = "heatmap")]
+    Heatmap {
         session_id: String,
     },
 }
@@ -653,9 +660,44 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
                 Ok(Some(format!("{report:#?}")))
             }
         }
+        #[cfg(feature = "heatmap")]
+        CommandMode::Heatmap { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let analyzer = SessionAnalyzer::new();
+            let report = analyzer.analyze(&session, &activities);
+
+            let heatmap = ProjectHeatmap::new();
+            let workspace_root = env::current_dir()?;
+            let output = heatmap.generate(&workspace_root, &report.modified_files)?;
+            Ok(Some(output))
+        }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorError> {
     let raw_args: Vec<String> = args.into_iter().collect();
     if raw_args.is_empty() {
@@ -752,6 +794,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "compare" => parse_compare_mode(&positional)?,
         #[cfg(feature = "auditor")]
         "audit" => parse_audit_mode(&positional)?,
+        #[cfg(feature = "heatmap")]
+        "heatmap" => parse_heatmap_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -853,6 +897,18 @@ fn parse_audit_mode(positional: &[String]) -> Result<CommandMode, DirectorError>
     })
 }
 
+#[cfg(feature = "heatmap")]
+fn parse_heatmap_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "heatmap requires: heatmap <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Heatmap {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -876,6 +932,9 @@ fn usage() -> String {
 
     #[cfg(feature = "auditor")]
     msg.push_str("\n  director audit <session_id> [--json]");
+
+    #[cfg(feature = "heatmap")]
+    msg.push_str("\n  director heatmap <session_id> [--json]");
 
     msg
 }
