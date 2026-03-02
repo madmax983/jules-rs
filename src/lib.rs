@@ -32,6 +32,9 @@ mod comparator;
 #[cfg(feature = "auditor")]
 mod auditor;
 
+#[cfg(feature = "heatmap")]
+mod heatmap;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -64,3 +67,6 @@ pub use comparator::{ComparisonReport, SessionComparator};
 
 #[cfg(feature = "auditor")]
 pub use auditor::{AuditReport, SessionAuditor};
+
+#[cfg(feature = "heatmap")]
+pub use heatmap::ProjectHeatmap;

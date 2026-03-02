@@ -15,6 +15,7 @@ doctor = []
 scout = []
 comparator = []
 auditor = ["analytics", "doctor"]
+heatmap = ["analytics"]
 
 [dependencies]
 fs2 = "0.4.3"
