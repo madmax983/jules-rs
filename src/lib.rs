@@ -70,3 +70,9 @@ pub use auditor::{AuditReport, SessionAuditor};
 
 #[cfg(feature = "heatmap")]
 pub use heatmap::ProjectHeatmap;
+
+#[cfg(feature = "reviewer")]
+mod reviewer;
+
+#[cfg(feature = "reviewer")]
+pub use reviewer::{ReviewIssue, SessionReviewer};
