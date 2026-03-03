@@ -10,7 +10,8 @@ use fs2::FileExt;
     feature = "narrator",
     feature = "comparator",
     feature = "auditor",
-    feature = "heatmap"
+    feature = "heatmap",
+    feature = "reviewer"
 ))]
 use jules_rs::ListActivitiesParams;
 #[cfg(feature = "scout")]
@@ -21,6 +22,8 @@ use jules_rs::SessionComparator;
 use jules_rs::SessionHtmlReporter;
 #[cfg(feature = "narrator")]
 use jules_rs::SessionNarrator;
+#[cfg(feature = "reviewer")]
+use jules_rs::SessionReviewer;
 use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
@@ -154,6 +157,10 @@ enum CommandMode {
     },
     #[cfg(feature = "heatmap")]
     Heatmap {
+        session_id: String,
+    },
+    #[cfg(feature = "reviewer")]
+    Review {
         session_id: String,
     },
 }
@@ -694,6 +701,53 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             let output = heatmap.generate(&workspace_root, &report.modified_files)?;
             Ok(Some(output))
         }
+        #[cfg(feature = "reviewer")]
+        CommandMode::Review { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let mut outputs = Vec::new();
+            if let Some(session_output) = session.output {
+                outputs.push(session_output);
+            }
+            outputs.extend(session.outputs);
+
+            for activity in activities {
+                if let Some(output) = activity.output {
+                    outputs.push(output);
+                }
+            }
+
+            let reviewer = SessionReviewer::new();
+            let report = reviewer.review_session(&outputs);
+
+            if cli.json {
+                Ok(Some(serde_json::to_string(&report)?))
+            } else {
+                Ok(Some(format!("{report}")))
+            }
+        }
     }
 }
 
@@ -796,6 +850,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "audit" => parse_audit_mode(&positional)?,
         #[cfg(feature = "heatmap")]
         "heatmap" => parse_heatmap_mode(&positional)?,
+        #[cfg(feature = "reviewer")]
+        "review" => parse_review_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -909,6 +965,18 @@ fn parse_heatmap_mode(positional: &[String]) -> Result<CommandMode, DirectorErro
     })
 }
 
+#[cfg(feature = "reviewer")]
+fn parse_review_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "review requires: review <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Review {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -935,6 +1003,9 @@ fn usage() -> String {
 
     #[cfg(feature = "heatmap")]
     msg.push_str("\n  director heatmap <session_id> [--json]");
+
+    #[cfg(feature = "reviewer")]
+    msg.push_str("\n  director review <session_id> [--json]");
 
     msg
 }

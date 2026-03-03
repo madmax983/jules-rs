@@ -35,6 +35,9 @@ mod auditor;
 #[cfg(feature = "heatmap")]
 mod heatmap;
 
+#[cfg(feature = "reviewer")]
+mod reviewer;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -70,3 +73,6 @@ pub use auditor::{AuditReport, SessionAuditor};
 
 #[cfg(feature = "heatmap")]
 pub use heatmap::ProjectHeatmap;
+
+#[cfg(feature = "reviewer")]
+pub use reviewer::{FindingSeverity, ReviewFinding, ReviewReport, SessionReviewer};
