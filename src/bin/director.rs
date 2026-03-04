@@ -11,7 +11,8 @@ use fs2::FileExt;
     feature = "comparator",
     feature = "auditor",
     feature = "heatmap",
-    feature = "reviewer"
+    feature = "reviewer",
+    feature = "risk_heatmap"
 ))]
 use jules_rs::ListActivitiesParams;
 #[cfg(feature = "scout")]
@@ -30,6 +31,10 @@ use jules_rs::{
 };
 #[cfg(feature = "heatmap")]
 use jules_rs::{ProjectHeatmap, SessionAnalyzer};
+#[cfg(feature = "risk_heatmap")]
+use jules_rs::{
+    ProjectRiskHeatmap, SessionAnalyzer as RiskAnalyzer, SessionReviewer as RiskReviewer,
+};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
@@ -161,6 +166,10 @@ enum CommandMode {
     },
     #[cfg(feature = "reviewer")]
     Review {
+        session_id: String,
+    },
+    #[cfg(feature = "risk_heatmap")]
+    RiskHeatmap {
         session_id: String,
     },
 }
@@ -748,6 +757,59 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
                 Ok(Some(format!("{report}")))
             }
         }
+        #[cfg(feature = "risk_heatmap")]
+        CommandMode::RiskHeatmap { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let analyzer = RiskAnalyzer::new();
+            let analysis_report = analyzer.analyze(&session, &activities);
+
+            let mut outputs = Vec::new();
+            if let Some(session_output) = session.output {
+                outputs.push(session_output);
+            }
+            outputs.extend(session.outputs.clone());
+
+            for activity in &activities {
+                if let Some(output) = &activity.output {
+                    outputs.push(output.clone());
+                }
+            }
+
+            let reviewer = RiskReviewer::new();
+            let review_report = reviewer.review_session(&outputs);
+
+            let heatmap = ProjectRiskHeatmap::new();
+            let workspace_root = env::current_dir()?;
+            let output = heatmap.generate(
+                &workspace_root,
+                &analysis_report.modified_files,
+                &review_report.findings,
+            )?;
+            Ok(Some(output))
+        }
     }
 }
 
@@ -852,6 +914,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "heatmap" => parse_heatmap_mode(&positional)?,
         #[cfg(feature = "reviewer")]
         "review" => parse_review_mode(&positional)?,
+        #[cfg(feature = "risk_heatmap")]
+        "risk-heatmap" => parse_risk_heatmap_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -924,6 +988,18 @@ fn parse_story_mode(positional: &[String]) -> Result<CommandMode, DirectorError>
         ));
     }
     Ok(CommandMode::Story {
+        session_id: positional[1].clone(),
+    })
+}
+
+#[cfg(feature = "risk_heatmap")]
+fn parse_risk_heatmap_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "risk-heatmap requires: risk-heatmap <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::RiskHeatmap {
         session_id: positional[1].clone(),
     })
 }
@@ -1006,6 +1082,9 @@ fn usage() -> String {
 
     #[cfg(feature = "reviewer")]
     msg.push_str("\n  director review <session_id> [--json]");
+
+    #[cfg(feature = "risk_heatmap")]
+    msg.push_str("\n  director risk-heatmap <session_id> [--json]");
 
     msg
 }
