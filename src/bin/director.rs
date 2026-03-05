@@ -163,6 +163,10 @@ enum CommandMode {
     Review {
         session_id: String,
     },
+    #[cfg(feature = "risk_heatmap")]
+    RiskHeatmap {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -748,6 +752,61 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
                 Ok(Some(format!("{report}")))
             }
         }
+        #[cfg(feature = "risk_heatmap")]
+        CommandMode::RiskHeatmap { session_id } => {
+            use jules_rs::{ProjectRiskHeatmap, SessionReviewer};
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let mut activities = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let mut outputs = Vec::new();
+            if let Some(session_output) = session.output {
+                outputs.push(session_output);
+            }
+            outputs.extend(session.outputs);
+
+            for activity in activities {
+                if let Some(output) = activity.output {
+                    outputs.push(output);
+                }
+            }
+
+            let reviewer = SessionReviewer::new();
+            let review_report = reviewer.review_session(&outputs);
+
+            let mut modified_files = Vec::new();
+            for output in &outputs {
+                for file in &output.changed_files {
+                    modified_files.push(file.path.clone());
+                }
+            }
+
+            let heatmap = ProjectRiskHeatmap::new();
+            let workspace_root = env::current_dir()?;
+            let report = heatmap.generate(&workspace_root, &modified_files, &review_report)?;
+
+            Ok(Some(report))
+        }
     }
 }
 
@@ -852,6 +911,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "heatmap" => parse_heatmap_mode(&positional)?,
         #[cfg(feature = "reviewer")]
         "review" => parse_review_mode(&positional)?,
+        #[cfg(feature = "risk_heatmap")]
+        "risk-heatmap" => parse_risk_heatmap_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -977,6 +1038,18 @@ fn parse_review_mode(positional: &[String]) -> Result<CommandMode, DirectorError
     })
 }
 
+#[cfg(feature = "risk_heatmap")]
+fn parse_risk_heatmap_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "risk-heatmap requires exactly one argument: <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::RiskHeatmap {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -1006,6 +1079,9 @@ fn usage() -> String {
 
     #[cfg(feature = "reviewer")]
     msg.push_str("\n  director review <session_id> [--json]");
+
+    #[cfg(feature = "risk_heatmap")]
+    msg.push_str("\n  director risk-heatmap <session_id> [--json]");
 
     msg
 }
