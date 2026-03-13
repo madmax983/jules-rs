@@ -1,0 +1,9 @@
+--- lib.rs
++++ lib.rs
+@@ -81,3 +84,6 @@
+
+ #[cfg(feature = "risk_heatmap")]
+ pub pub use risk_heatmap::ProjectRiskHeatmap;
++
++#[cfg(feature = "multiverse")]
++pub use multiverse::MultiverseVisualizer;
