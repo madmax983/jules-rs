@@ -167,6 +167,11 @@ enum CommandMode {
     RiskHeatmap {
         session_id: String,
     },
+    #[cfg(feature = "multiverse")]
+    Multiverse {
+        id_a: String,
+        id_b: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -805,6 +810,70 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             )?;
             Ok(Some(output))
         }
+        #[cfg(feature = "multiverse")]
+        CommandMode::Multiverse { id_a, id_b } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session_a = client.get_session(&id_a).await?;
+            let mut activities_a = Vec::new();
+            let mut page_token_a = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_a.name,
+                        jules_rs::ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token_a.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_a.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token_a = Some(token),
+                    _ => break,
+                }
+            }
+            activities_a.sort_by(|a, b| {
+                a.timestamp
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.timestamp.as_deref().unwrap_or(""))
+            });
+
+            let session_b = client.get_session(&id_b).await?;
+            let mut activities_b = Vec::new();
+            let mut page_token_b = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_b.name,
+                        jules_rs::ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token_b.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_b.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token_b = Some(token),
+                    _ => break,
+                }
+            }
+            activities_b.sort_by(|a, b| {
+                a.timestamp
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.timestamp.as_deref().unwrap_or(""))
+            });
+
+            let visualizer = jules_rs::MultiverseVisualizer::new();
+            let report =
+                visualizer.to_mermaid(&session_a, &activities_a, &session_b, &activities_b);
+            Ok(Some(report))
+        }
     }
 }
 
@@ -911,6 +980,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "review" => parse_review_mode(&positional)?,
         #[cfg(feature = "risk_heatmap")]
         "risk-heatmap" => parse_risk_heatmap_mode(&positional)?,
+        #[cfg(feature = "multiverse")]
+        "multiverse" => parse_multiverse_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -1048,6 +1119,19 @@ fn parse_risk_heatmap_mode(positional: &[String]) -> Result<CommandMode, Directo
     })
 }
 
+#[cfg(feature = "multiverse")]
+fn parse_multiverse_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 3 {
+        return Err(DirectorError::Usage(
+            "multiverse requires: multiverse <session_id_a> <session_id_b>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Multiverse {
+        id_a: positional[1].clone(),
+        id_b: positional[2].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -1080,6 +1164,9 @@ fn usage() -> String {
 
     #[cfg(feature = "risk_heatmap")]
     msg.push_str("\n  director risk-heatmap <session_id> [--json]");
+
+    #[cfg(feature = "multiverse")]
+    msg.push_str("\n  director multiverse <session_id_a> <session_id_b> [--json]");
 
     msg
 }
