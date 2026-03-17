@@ -82,3 +82,8 @@ pub use reviewer::{FindingSeverity, ReviewFinding, ReviewReport, SessionReviewer
 
 #[cfg(feature = "risk_heatmap")]
 pub use risk_heatmap::ProjectRiskHeatmap;
+
+#[cfg(feature = "multiverse")]
+mod multiverse;
+#[cfg(feature = "multiverse")]
+pub use multiverse::MultiverseVisualizer;

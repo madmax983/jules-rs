@@ -16,6 +16,7 @@ scout = []
 comparator = []
 auditor = ["analytics", "doctor"]
 heatmap = ["analytics"]
+multiverse = ["comparator", "visualizer"]
 reviewer = []
 risk_heatmap = ["reviewer", "heatmap"]
 
