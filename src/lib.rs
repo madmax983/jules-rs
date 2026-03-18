@@ -29,6 +29,9 @@ mod scout;
 #[cfg(feature = "comparator")]
 mod comparator;
 
+#[cfg(feature = "multiverse")]
+mod multiverse;
+
 #[cfg(feature = "auditor")]
 mod auditor;
 
@@ -70,6 +73,9 @@ pub use scout::ProjectScout;
 
 #[cfg(feature = "comparator")]
 pub use comparator::{ComparisonReport, SessionComparator};
+
+#[cfg(feature = "multiverse")]
+pub use multiverse::MultiverseVisualizer;
 
 #[cfg(feature = "auditor")]
 pub use auditor::{AuditReport, SessionAuditor};
