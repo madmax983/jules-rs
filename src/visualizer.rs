@@ -138,7 +138,7 @@ impl SessionVisualizer {
         out
     }
 
-    fn escape_label(s: &str) -> String {
+    pub(crate) fn escape_label(s: &str) -> String {
         s.replace('"', "'").replace('\n', "<br>")
     }
 
