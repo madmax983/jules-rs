@@ -6,6 +6,7 @@ rust-version = "1.85"
 
 [features]
 visualizer = []
+multiverse = ["comparator", "visualizer"]
 analytics = []
 report = ["visualizer", "analytics"]
 narrator = []
