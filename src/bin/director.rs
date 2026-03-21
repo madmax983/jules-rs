@@ -144,6 +144,11 @@ enum CommandMode {
     Story {
         session_id: String,
     },
+    #[cfg(feature = "multiverse")]
+    Multiverse {
+        session_id_a: String,
+        session_id_b: String,
+    },
     #[cfg(feature = "scout")]
     Scout,
     #[cfg(feature = "comparator")]
@@ -577,6 +582,75 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             // 4. Output to stdout
             Ok(Some(format!("{story}")))
         }
+        #[cfg(feature = "multiverse")]
+        #[allow(clippy::similar_names)]
+        CommandMode::Multiverse {
+            session_id_a,
+            session_id_b,
+        } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            // Fetch session A
+            let session_a = client.get_session(&session_id_a).await?;
+            let mut activities_a = Vec::new();
+            let mut page_token_a = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_a.name,
+                        jules_rs::ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token_a.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_a.extend(response.activities);
+                if response.next_page_token.as_deref().unwrap_or("").is_empty() {
+                    break;
+                }
+                page_token_a = response.next_page_token;
+            }
+            activities_a.reverse(); // Display chronological
+
+            // Fetch session B
+            let session_b = client.get_session(&session_id_b).await?;
+            let mut activities_b = Vec::new();
+            let mut page_token_b = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_b.name,
+                        jules_rs::ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token_b.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_b.extend(response.activities);
+                if response.next_page_token.as_deref().unwrap_or("").is_empty() {
+                    break;
+                }
+                page_token_b = response.next_page_token;
+            }
+            activities_b.reverse();
+
+            let viz = jules_rs::MultiverseVisualizer::new();
+            let mermaid = viz.to_mermaid(&session_a, &activities_a, &session_b, &activities_b);
+
+            if cli.json {
+                let out = serde_json::json!({
+                    "sessionAId": session_id_a,
+                    "sessionBId": session_id_b,
+                    "mermaid": mermaid
+                });
+                Ok(Some(serde_json::to_string_pretty(&out)?))
+            } else {
+                Ok(Some(mermaid))
+            }
+        }
         #[cfg(feature = "scout")]
         CommandMode::Scout => {
             let scout = ProjectScout::new();
@@ -901,6 +975,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
             }
             CommandMode::Scout
         }
+        #[cfg(feature = "multiverse")]
+        "multiverse" => parse_multiverse_mode(&positional)?,
         #[cfg(feature = "comparator")]
         "compare" => parse_compare_mode(&positional)?,
         #[cfg(feature = "auditor")]
@@ -987,6 +1063,19 @@ fn parse_story_mode(positional: &[String]) -> Result<CommandMode, DirectorError>
     })
 }
 
+#[cfg(feature = "multiverse")]
+fn parse_multiverse_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 3 {
+        return Err(DirectorError::Usage(
+            "multiverse requires: multiverse <session_id_a> <session_id_b>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Multiverse {
+        session_id_a: positional[1].clone(),
+        session_id_b: positional[2].clone(),
+    })
+}
+
 #[cfg(feature = "comparator")]
 fn parse_compare_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
     if positional.len() != 3 {
@@ -1065,6 +1154,9 @@ fn usage() -> String {
 
     #[cfg(feature = "scout")]
     msg.push_str("\n  director scout [--json]");
+
+    #[cfg(feature = "multiverse")]
+    msg.push_str("\n  director multiverse <session_id_a> <session_id_b> [--json]");
 
     #[cfg(feature = "comparator")]
     msg.push_str("\n  director compare <session_id_a> <session_id_b> [--json]");

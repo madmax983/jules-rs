@@ -2,6 +2,10 @@ use std::fmt::Write;
 
 use crate::{Activity, Session, SessionState};
 
+pub(crate) fn escape_label(s: &str) -> String {
+    s.replace('"', "'").replace('\n', "<br>")
+}
+
 /// Visualizes a session as a Mermaid diagram.
 #[derive(Debug, Default)]
 pub struct SessionVisualizer;
@@ -53,7 +57,7 @@ impl SessionVisualizer {
             let _ = writeln!(out, "    direction TB");
             for (i, step) in plan.steps.iter().enumerate() {
                 let id = format!("step_{i}");
-                let desc = Self::escape_label(&step.description);
+                let desc = escape_label(&step.description);
                 let _ = writeln!(out, "    {id}[\"{desc}\"]");
                 if i > 0 {
                     let prev = format!("step_{}", i - 1);
@@ -92,7 +96,7 @@ impl SessionVisualizer {
             let node_text = if detail.is_empty() {
                 label.to_string()
             } else {
-                format!("**{label}**<br>{}", Self::escape_label(detail))
+                format!("**{label}**<br>{}", escape_label(detail))
             };
 
             let _ = writeln!(out, "    {node_id}{shape_open}\"{node_text}\"{shape_close}");
@@ -136,10 +140,6 @@ impl SessionVisualizer {
         }
 
         out
-    }
-
-    fn escape_label(s: &str) -> String {
-        s.replace('"', "'").replace('\n', "<br>")
     }
 
     fn escape_note(s: &str) -> String {
