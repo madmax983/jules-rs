@@ -1,9 +1,9 @@
 use crate::SessionOutput;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 /// Severity level for a review finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FindingSeverity {
     /// Informational note or minor suggestion.
@@ -25,7 +25,7 @@ impl Display for FindingSeverity {
 }
 
 /// A specific finding identified during a code review.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewFinding {
     /// Path of the file related to the finding.
