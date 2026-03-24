@@ -24,6 +24,19 @@ use jules_rs::SessionHtmlReporter;
 use jules_rs::SessionNarrator;
 #[cfg(feature = "reviewer")]
 use jules_rs::SessionReviewer;
+#[cfg(feature = "forensics")]
+use jules_rs::SessionForensics;
+#[cfg(any(
+    feature = "report",
+    feature = "narrator",
+    feature = "comparator",
+    feature = "auditor",
+    feature = "heatmap",
+    feature = "reviewer",
+    feature = "risk_heatmap",
+    feature = "forensics"
+))]
+use jules_rs::Activity;
 use jules_rs::{
     AutomationMode, CreateSessionRequest, JulesClient, JulesError, RetryPolicy, Session,
     SessionGithubRepoContext, SessionState, Source, SourceContext, TimeoutPolicy,
@@ -165,6 +178,10 @@ enum CommandMode {
     },
     #[cfg(feature = "risk_heatmap")]
     RiskHeatmap {
+        session_id: String,
+    },
+    #[cfg(feature = "forensics")]
+    Forensics {
         session_id: String,
     },
 }
@@ -805,6 +822,44 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             )?;
             Ok(Some(output))
         }
+        #[cfg(feature = "forensics")]
+        CommandMode::Forensics { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let activities = fetch_all_activities(&client, &session.name).await?;
+
+            let forensics = SessionForensics::new();
+            let report = forensics.analyze(&session.name, &activities);
+
+            if cli.json {
+                Ok(Some(serde_json::to_string_pretty(&report)?))
+            } else {
+                use std::fmt::Write;
+                let mut out = format!("Session Forensics Report for {}\n========================================\n\n", report.session_name);
+                if report.activity_findings.is_empty() {
+                    out.push_str("No findings detected.\n");
+                } else {
+                    for activity_findings in report.activity_findings {
+                        let _ = writeln!(out, "Activity: {}", activity_findings.activity_id);
+                        for finding in activity_findings.findings {
+                            let line_info = match finding.line_number {
+                                Some(line) => format!(":{line}"),
+                                None => String::new(),
+                            };
+                            let _ = writeln!(
+                                out,
+                                "  [{}] {}{} - {}",
+                                finding.severity, finding.file_path, line_info, finding.message
+                            );
+                        }
+                        out.push('\n');
+                    }
+                }
+                Ok(Some(out))
+            }
+        }
     }
 }
 
@@ -911,6 +966,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "review" => parse_review_mode(&positional)?,
         #[cfg(feature = "risk_heatmap")]
         "risk-heatmap" => parse_risk_heatmap_mode(&positional)?,
+        #[cfg(feature = "forensics")]
+        "forensics" => parse_forensics_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -1048,7 +1105,20 @@ fn parse_risk_heatmap_mode(positional: &[String]) -> Result<CommandMode, Directo
     })
 }
 
+#[cfg(feature = "forensics")]
+fn parse_forensics_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "forensics requires: forensics <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Forensics {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
+    #[allow(unused_mut)]
     let mut msg = String::from(
         "director usage:
   director init \"<goal>\" \"<source>\" [--state <path>] [--json]
@@ -1080,6 +1150,9 @@ fn usage() -> String {
 
     #[cfg(feature = "risk_heatmap")]
     msg.push_str("\n  director risk-heatmap <session_id> [--json]");
+
+    #[cfg(feature = "forensics")]
+    msg.push_str("\n  director forensics <session_id> [--json]");
 
     msg
 }
@@ -1286,6 +1359,42 @@ async fn run_until_settled(
     Err(DirectorError::InvalidState(format!(
         "run loop hit --max-cycles={max_cycles} before settling"
     )))
+}
+
+#[cfg(any(
+    feature = "report",
+    feature = "narrator",
+    feature = "comparator",
+    feature = "auditor",
+    feature = "heatmap",
+    feature = "reviewer",
+    feature = "risk_heatmap",
+    feature = "forensics"
+))]
+async fn fetch_all_activities(
+    client: &JulesClient,
+    session_name: &str,
+) -> Result<Vec<Activity>, JulesError> {
+    let mut activities = Vec::new();
+    let mut page_token = None;
+    loop {
+        let response = client
+            .list_activities(
+                session_name,
+                jules_rs::ListActivitiesParams {
+                    page_size: Some(100),
+                    page_token: page_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        activities.extend(response.activities);
+        match response.next_page_token {
+            Some(token) if !token.is_empty() => page_token = Some(token),
+            _ => break,
+        }
+    }
+    Ok(activities)
 }
 
 async fn tick_once(
