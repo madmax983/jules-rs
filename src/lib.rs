@@ -41,6 +41,9 @@ mod reviewer;
 #[cfg(feature = "risk_heatmap")]
 mod risk_heatmap;
 
+#[cfg(feature = "forensics")]
+mod forensics;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
@@ -82,3 +85,6 @@ pub use reviewer::{FindingSeverity, ReviewFinding, ReviewReport, SessionReviewer
 
 #[cfg(feature = "risk_heatmap")]
 pub use risk_heatmap::ProjectRiskHeatmap;
+
+#[cfg(feature = "forensics")]
+pub use forensics::{ActivityFinding, ForensicsReport, SessionForensics};
