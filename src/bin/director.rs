@@ -48,6 +48,32 @@ const DEFAULT_AUTO_FEEDBACK_MESSAGE: &str = "Continue autonomously with the best
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+async fn fetch_all_activities(
+    client: &jules_rs::JulesClient,
+    session_name: &str,
+) -> Result<Vec<jules_rs::Activity>, DirectorError> {
+    let mut activities = Vec::new();
+    let mut page_token = None;
+    loop {
+        let response = client
+            .list_activities(
+                session_name,
+                jules_rs::ListActivitiesParams {
+                    page_size: Some(100),
+                    page_token: page_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        activities.extend(response.activities);
+        match response.next_page_token {
+            Some(token) if !token.is_empty() => page_token = Some(token),
+            _ => break,
+        }
+    }
+    Ok(activities)
+}
+
 #[derive(Debug, thiserror::Error)]
 enum DirectorError {
     #[error("missing environment variable `JULES_API_KEY`")]
@@ -165,6 +191,10 @@ enum CommandMode {
     },
     #[cfg(feature = "risk_heatmap")]
     RiskHeatmap {
+        session_id: String,
+    },
+    #[cfg(feature = "forensics")]
+    Forensics {
         session_id: String,
     },
 }
@@ -805,6 +835,23 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             )?;
             Ok(Some(output))
         }
+        #[cfg(feature = "forensics")]
+        CommandMode::Forensics { session_id } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            let session = client.get_session(&session_id).await?;
+            let activities = fetch_all_activities(&client, &session.name).await?;
+
+            let forensics = jules_rs::SessionForensics::new();
+            let report = forensics.analyze(&activities);
+
+            if cli.json {
+                Ok(Some(serde_json::to_string(&report)?))
+            } else {
+                Ok(Some(format!("{report}")))
+            }
+        }
     }
 }
 
@@ -911,6 +958,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         "review" => parse_review_mode(&positional)?,
         #[cfg(feature = "risk_heatmap")]
         "risk-heatmap" => parse_risk_heatmap_mode(&positional)?,
+        #[cfg(feature = "forensics")]
+        "forensics" => parse_forensics_mode(&positional)?,
         _ => return Err(DirectorError::Usage(usage())),
     };
 
@@ -1048,6 +1097,18 @@ fn parse_risk_heatmap_mode(positional: &[String]) -> Result<CommandMode, Directo
     })
 }
 
+#[cfg(feature = "forensics")]
+fn parse_forensics_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 2 {
+        return Err(DirectorError::Usage(
+            "forensics requires: forensics <session_id>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Forensics {
+        session_id: positional[1].clone(),
+    })
+}
+
 fn usage() -> String {
     let mut msg = String::from(
         "director usage:
@@ -1080,6 +1141,8 @@ fn usage() -> String {
 
     #[cfg(feature = "risk_heatmap")]
     msg.push_str("\n  director risk-heatmap <session_id> [--json]");
+    #[cfg(feature = "forensics")]
+    msg.push_str("\n  director forensics <session-id> [--json]");
 
     msg
 }
