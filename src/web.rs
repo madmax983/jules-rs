@@ -73,7 +73,7 @@ pub async fn run() -> Result<(), String> {
         .map_err(|_| "web context was already initialized".to_string())?;
 
     autumn_web::app()
-        .routes(routes![index, api_summary])
+        .routes(routes![index, api_summary, delete_session_route])
         .run()
         .await;
 
@@ -556,12 +556,29 @@ struct IndexParams {
 
 /// A pre-rendered table row, decoupled from Maud so it stays unit-testable.
 struct Row {
+    /// Bare session id (no `sessions/` prefix), used for the delete route.
+    id: String,
     repo: String,
     title: String,
     state: SessionState,
     create_time: Option<String>,
     update_time: Option<String>,
     url: Option<String>,
+}
+
+/// Bare session id (no `sessions/` prefix) suitable for the delete route path
+/// segment. Prefers the explicit `id` field, falling back to the resource name.
+fn session_ident(session: &Session) -> String {
+    if let Some(id) = &session.id {
+        if !id.trim().is_empty() {
+            return id.clone();
+        }
+    }
+    session
+        .name
+        .strip_prefix("sessions/")
+        .unwrap_or(&session.name)
+        .to_string()
 }
 
 /// Build, filter, and sort the table rows from the sessions.
@@ -573,6 +590,7 @@ fn build_rows(
     let mut rows: Vec<Row> = sessions
         .iter()
         .map(|session| Row {
+            id: session_ident(session),
             repo: repo_label(session, labels),
             title: session_title(session),
             state: session_state(session),
@@ -642,6 +660,34 @@ async fn api_summary() -> Result<Json<Summary>, (StatusCode, Json<serde_json::Va
     })?;
 
     Ok(Json(Summary::from_sessions(&sessions)))
+}
+
+/// Delete a single session by bare id (for example `s-42`). The dashboard's
+/// per-row ✕ control POSTs here; on success the client reloads so all headline
+/// numbers recompute from fresh data.
+///
+/// Returns `200 OK` on success, `400 Bad Request` for an invalid id, and
+/// `502 Bad Gateway` when the Jules API rejects or cannot service the deletion.
+/// The API `Result` is always handled — the handler never panics on failure.
+#[post("/sessions/{id}/delete")]
+async fn delete_session_route(Path(id): Path<String>) -> (StatusCode, String) {
+    let Some(context) = CONTEXT.get() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "dashboard context is not initialized".to_string(),
+        );
+    };
+
+    match context.client.delete_session(&id).await {
+        Ok(()) => (StatusCode::OK, format!("deleted session {id}")),
+        Err(error) => {
+            let status = match &error {
+                JulesError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, format!("failed to delete session {id}: {error}"))
+        }
+    }
 }
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -864,6 +910,7 @@ fn render_dashboard(
                             th { "State" }
                             th { "Created" }
                             th { "Updated" }
+                            th class="kill-col" aria-label="Delete" { "" }
                         }
                     }
                     tbody {
@@ -885,6 +932,13 @@ fn render_dashboard(
                                 }
                                 td class="mono muted" { (format_time(row.create_time.as_deref())) }
                                 td class="mono muted" { (format_time(row.update_time.as_deref())) }
+                                td class="kill-cell" {
+                                    button type="button" class="kill"
+                                        data-id=(row.id)
+                                        data-title=(truncate(&row.title, 60))
+                                        title="Delete session"
+                                        aria-label="Delete session" { "✕" }
+                                }
                             }
                         }
                     }
@@ -893,6 +947,8 @@ fn render_dashboard(
                     p class="muted" { "No sessions match the current filters." }
                 }
             }
+
+            script { (PreEscaped(DELETE_SCRIPT)) }
         },
     )
 }
@@ -1136,7 +1192,74 @@ a:hover { text-decoration: underline; }
     padding: 24px;
 }
 .error-card h2 { margin-top: 0; color: #fca5a5; }
+.kill-col { width: 34px; }
+.kill-cell { text-align: center; width: 34px; }
+.kill {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #475569;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.kill:hover { color: #ef4444; background: #ef444422; border-color: #ef444455; }
+.kill.armed { color: #fff; background: #ef4444; border-color: #ef4444; font-weight: 700; }
+.kill:disabled { opacity: 0.55; cursor: default; }
 ";
+
+/// Inline script powering the per-row ✕ delete control. First click *arms* the
+/// button (a two-click confirm, no modal); a second click within a few seconds
+/// POSTs to `/sessions/{id}/delete`. On success the page reloads so every
+/// headline/heatmap/count recomputes from fresh data; on failure it surfaces
+/// the server message and leaves the page untouched.
+const DELETE_SCRIPT: &str = r#"
+(function () {
+    function disarm(btn) {
+        btn.dataset.armed = '0';
+        btn.classList.remove('armed');
+        btn.textContent = '✕';
+        btn.title = 'Delete session';
+        if (btn._t) { clearTimeout(btn._t); btn._t = null; }
+    }
+    document.addEventListener('click', function (e) {
+        var btn = e.target.closest('.kill');
+        if (!btn) { return; }
+        e.preventDefault();
+        if (btn.disabled) { return; }
+        if (btn.dataset.armed !== '1') {
+            document.querySelectorAll('.kill[data-armed="1"]').forEach(disarm);
+            btn.dataset.armed = '1';
+            btn.classList.add('armed');
+            btn.textContent = '✕?';
+            btn.title = 'Click again to confirm delete of ' + (btn.dataset.title || btn.dataset.id);
+            btn._t = setTimeout(function () { disarm(btn); }, 4000);
+            return;
+        }
+        if (btn._t) { clearTimeout(btn._t); btn._t = null; }
+        btn.disabled = true;
+        btn.textContent = '…';
+        var id = btn.dataset.id;
+        fetch('/sessions/' + encodeURIComponent(id) + '/delete', { method: 'POST' })
+            .then(function (r) {
+                if (r.ok) { location.reload(); return; }
+                return r.text().then(function (t) {
+                    window.alert('Delete failed: ' + (t || ('HTTP ' + r.status)));
+                    btn.disabled = false;
+                    disarm(btn);
+                });
+            })
+            .catch(function (err) {
+                window.alert('Delete failed: ' + err);
+                btn.disabled = false;
+                disarm(btn);
+            });
+    });
+})();
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -1393,6 +1516,34 @@ mod tests {
     fn truncate_adds_ellipsis_only_when_needed() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 5), "abcde…");
+    }
+
+    #[test]
+    fn session_ident_prefers_id_then_strips_prefix() {
+        // Missing id falls back to the resource name with the prefix stripped.
+        let mut s = session(None, None); // name = "sessions/x"
+        assert_eq!(session_ident(&s), "x");
+        // An explicit id wins.
+        s.id = Some("s-99".to_string());
+        assert_eq!(session_ident(&s), "s-99");
+    }
+
+    #[test]
+    fn session_row_renders_delete_control() {
+        let mut s = session(Some(SessionState::Queued), Some("2026-07-15T09:00:00Z"));
+        s.id = Some("s-42".to_string());
+        s.title = Some("zombie task".to_string());
+
+        let labels = BTreeMap::new();
+        let params = IndexParams::default();
+        let html = render_dashboard(std::slice::from_ref(&s), &labels, &params).into_string();
+
+        // The ✕ button carries the bare session id used to build the route.
+        assert!(html.contains(r#"class="kill""#));
+        assert!(html.contains(r#"data-id="s-42""#));
+        assert!(html.contains(r#"aria-label="Delete session""#));
+        // The inline script POSTs to /sessions/{id}/delete for that id.
+        assert!(html.contains("'/sessions/' + encodeURIComponent(id) + '/delete'"));
     }
 
     /// Renders the dashboard with a synthetic dataset and writes it to disk for
