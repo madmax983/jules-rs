@@ -41,6 +41,9 @@ mod reviewer;
 #[cfg(feature = "risk_heatmap")]
 mod risk_heatmap;
 
+#[cfg(feature = "web")]
+pub mod web;
+
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
 pub use error::{ApiError, JulesError};
