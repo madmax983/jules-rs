@@ -18,6 +18,7 @@ auditor = ["analytics", "doctor"]
 heatmap = ["analytics"]
 reviewer = []
 risk_heatmap = ["reviewer", "heatmap"]
+web = ["dep:autumn-web", "dep:maud"]
 
 [dependencies]
 fs2 = "0.4.3"
@@ -28,6 +29,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.27", optional = true }
+autumn-web = { version = "0.5.0", optional = true, default-features = false, features = ["maud", "htmx"] }
+maud = { version = "0.27", optional = true, features = ["axum"] }
 
 [dev-dependencies]
 fs2 = "0.4.3"
@@ -46,6 +49,11 @@ required-features = ["tui"]
 name = "jules-player"
 path = "src/bin/player.rs"
 required-features = ["player"]
+
+[[bin]]
+name = "jules-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
 
 [lints.rust]
 unsafe_code = "warn"
