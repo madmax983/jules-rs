@@ -10,12 +10,15 @@
 //! tested without any network access.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use autumn_web::prelude::*;
 use serde::Serialize;
+use tokio::task::JoinSet;
 
+use crate::github::{GithubClient, JulesMatcher, Pr};
 use crate::{
     JulesClient, JulesError, ListSessionsParams, ListSourcesParams, Session, SessionState, Source,
     TimeoutPolicy,
@@ -25,6 +28,8 @@ use crate::{
 /// stateless route handlers registered through the `routes!` macro.
 struct WebContext {
     client: JulesClient,
+    /// GitHub client for the PRs tab, present only when `GITHUB_TOKEN` is set.
+    github: Option<Arc<GithubClient>>,
 }
 
 static CONTEXT: OnceLock<WebContext> = OnceLock::new();
@@ -68,12 +73,18 @@ pub fn build_client_from_env() -> Result<JulesClient, String> {
 /// error page rather than propagated here.
 pub async fn run() -> Result<(), String> {
     let client = build_client_from_env()?;
+    let github = GithubClient::from_env().map(Arc::new);
     CONTEXT
-        .set(WebContext { client })
+        .set(WebContext { client, github })
         .map_err(|_| "web context was already initialized".to_string())?;
 
     autumn_web::app()
-        .routes(routes![index, api_summary, delete_session_route])
+        .routes(routes![
+            index,
+            api_summary,
+            delete_session_route,
+            close_all_prs
+        ])
         .run()
         .await;
 
@@ -660,6 +671,19 @@ async fn index(Query(params): Query<IndexParams>) -> Markup {
     };
 
     let labels = source_labels(&sources);
+
+    // The PRs tab needs async, network-fetched data — do the GitHub work only
+    // when it is the selected tab so the other tabs stay fast.
+    if selected_tab(&params) == "prs" {
+        let Some(github) = context.github.as_ref() else {
+            return render_prs_dashboard(&[], false);
+        };
+        let matcher = JulesMatcher::from_env();
+        let repos = distinct_repos(&labels);
+        let groups = fetch_pr_groups(Arc::clone(github), &matcher, repos, current_unix()).await;
+        return render_prs_dashboard(&groups, true);
+    }
+
     render_dashboard(&sessions, &labels, &params)
 }
 
@@ -710,17 +734,101 @@ async fn delete_session_route(Path(id): Path<String>) -> (StatusCode, String) {
     }
 }
 
+/// Form fields `POSTed` by the guarded "close all Jules PRs" control.
+#[derive(Debug, serde::Deserialize)]
+struct CloseAllForm {
+    owner: String,
+    repo: String,
+    /// The typed `owner/repo` confirmation string.
+    confirm: String,
+    /// Present (`"on"`) only when the "delete head branches" box was checked.
+    delete_branches: Option<String>,
+}
+
+/// Guarded mass-close of every Jules-authored open PR in one repository.
+///
+/// Safety invariants enforced here, server-side, regardless of page state:
+/// 1. `confirm` must equal `owner/repo` exactly, or the request is rejected.
+/// 2. The open PR list is re-fetched and re-classified with [`JulesMatcher`];
+///    only PRs the server independently flags as Jules are ever closed. A
+///    client-supplied list of PR numbers is never trusted.
+///
+/// Returns an HTML results page (no auto-refresh) with per-PR outcomes.
+#[post("/prs/close-all")]
+async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
+    let Some(context) = CONTEXT.get() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            render_close_error("dashboard context is not initialized"),
+        );
+    };
+    let Some(github) = context.github.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            render_close_error(
+                "GITHUB_TOKEN is not configured on the server, so PRs cannot be closed.",
+            ),
+        );
+    };
+
+    let expected = format!("{}/{}", form.owner, form.repo);
+    if form.confirm.trim() != expected {
+        return (
+            StatusCode::BAD_REQUEST,
+            render_close_error(&format!(
+                "Confirmation text did not match. Expected `{expected}`, so nothing was closed."
+            )),
+        );
+    }
+
+    let delete_branches = form
+        .delete_branches
+        .as_deref()
+        .is_some_and(|value| matches!(value, "on" | "true" | "1"));
+
+    // Re-fetch and re-classify server-side — never trust the page's list.
+    let matcher = JulesMatcher::from_env();
+    let targets: Vec<Pr> = match github.list_open_pulls(&form.owner, &form.repo).await {
+        Ok(prs) => prs.into_iter().filter(|pr| matcher.is_jules(pr)).collect(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                render_close_error(&format!("failed to list open pulls for {expected}: {error}")),
+            );
+        }
+    };
+
+    let outcomes = close_prs(
+        Arc::clone(github),
+        &form.owner,
+        &form.repo,
+        targets,
+        delete_branches,
+    )
+    .await;
+
+    (
+        StatusCode::OK,
+        render_close_result(&expected, delete_branches, &outcomes),
+    )
+}
+
 // ── Rendering ────────────────────────────────────────────────────
 
-/// Shared page chrome: dark theme, inline CSS, and a 10s auto-refresh meta tag.
-fn page_shell(title: &str, body: &Markup) -> Markup {
+/// Shared page chrome: dark theme and inline CSS. When `auto_refresh` is set a
+/// 10s meta-refresh tag is emitted; the PRs tab and the close-all results page
+/// pass `false` so the refresh cannot interrupt typing a confirmation or re-hit
+/// GitHub on a timer.
+fn page_shell(title: &str, body: &Markup, auto_refresh: bool) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta http-equiv="refresh" content="10";
+                @if auto_refresh {
+                    meta http-equiv="refresh" content="10";
+                }
                 title { (title) }
                 style { (PreEscaped(STYLES)) }
             }
@@ -747,15 +855,17 @@ fn render_error(message: &str) -> Markup {
                 p class="muted" { "The page will retry automatically in a few seconds." }
             }
         },
+        true,
     )
 }
 
 /// The tabs shown in the dashboard nav, in display order: `(slug, label)`.
-const TABS: [(&str, &str); 4] = [
+const TABS: [(&str, &str); 5] = [
     ("in-progress", "In Progress"),
     ("overview", "Overview"),
     ("sessions", "Sessions"),
     ("schedule", "Schedule"),
+    ("prs", "PRs"),
 ];
 
 /// Resolve the selected tab slug from the query params, defaulting to the
@@ -765,6 +875,7 @@ fn selected_tab(params: &IndexParams) -> &'static str {
         Some("overview") => "overview",
         Some("sessions") => "sessions",
         Some("schedule") => "schedule",
+        Some("prs") => "prs",
         _ => "in-progress",
     }
 }
@@ -804,34 +915,61 @@ fn delete_button(row: &Row) -> Markup {
     }
 }
 
+/// Wrap a tab body in the shared dashboard chrome (top bar, tab nav, inline
+/// scripts). `auto_refresh` toggles the 10s meta-refresh — passed `false` for
+/// the PRs tab so it never re-hits GitHub on a timer or interrupts typing.
+fn dashboard_page(active: &str, body: &Markup, auto_refresh: bool) -> Markup {
+    let subtitle = if auto_refresh {
+        "cross-repo session activity · auto-refreshing"
+    } else {
+        "cross-repo Jules PR management"
+    };
+    page_shell(
+        "Jules Dashboard",
+        &html! {
+            header class="topbar" {
+                h1 { "Jules Dashboard" }
+                span class="muted" { (subtitle) }
+            }
+            (render_tabs(active))
+            (body)
+            script { (PreEscaped(DELETE_SCRIPT)) }
+            script { (PreEscaped(PR_CONFIRM_SCRIPT)) }
+        },
+        auto_refresh,
+    )
+}
+
 /// Render the full populated dashboard: shared chrome, the tab nav, and the
 /// selected tab's body. Dispatches on the `tab` query param; the default is the
 /// dedicated In Progress landing view.
+///
+/// The PRs tab needs async, network-fetched data, so the `index` handler renders
+/// it directly via [`render_prs_dashboard`]; here it degrades to the no-token
+/// notice so the pure, session-only path stays synchronous and testable.
 fn render_dashboard(
     sessions: &[Session],
     labels: &BTreeMap<String, String>,
     params: &IndexParams,
 ) -> Markup {
     let active = selected_tab(params);
+    if active == "prs" {
+        return render_prs_dashboard(&[], false);
+    }
     let body = match active {
         "overview" => render_overview(sessions, labels),
         "sessions" => render_sessions(sessions, labels, params),
         "schedule" => render_schedule(sessions, labels),
         _ => render_in_progress(sessions, labels),
     };
+    dashboard_page(active, &body, true)
+}
 
-    page_shell(
-        "Jules Dashboard",
-        &html! {
-            header class="topbar" {
-                h1 { "Jules Dashboard" }
-                span class="muted" { "cross-repo session activity · auto-refreshing" }
-            }
-            (render_tabs(active))
-            (body)
-            script { (PreEscaped(DELETE_SCRIPT)) }
-        },
-    )
+/// Render the PRs tab inside the shared dashboard chrome. Takes already-fetched
+/// data so it stays synchronous and unit-testable; the `index` handler supplies
+/// the live groups, the demo test supplies sample groups.
+fn render_prs_dashboard(groups: &[RepoPrGroup], has_token: bool) -> Markup {
+    dashboard_page("prs", &render_prs(groups, has_token), false)
 }
 
 /// Dedicated In Progress landing view: every `InProgress` session across all
@@ -1143,6 +1281,411 @@ fn hour_short(key: &str) -> String {
         .map_or_else(|| key.to_string(), |(_, time)| time.to_string())
 }
 
+// ── PRs tab ──────────────────────────────────────────────────────
+
+/// Max concurrent per-repo PR-list requests during a PRs-tab render.
+const PR_FETCH_CONCURRENCY: usize = 6;
+
+/// Max concurrent close/delete requests during a mass-close.
+const PR_CLOSE_CONCURRENCY: usize = 5;
+
+/// Max PRs listed per repo panel before collapsing to a "+N more" note.
+const PR_LIST_CAP: usize = 50;
+
+/// A single Jules PR as rendered in a repo panel.
+struct PrView {
+    number: u64,
+    title: String,
+    age: String,
+    html_url: String,
+}
+
+/// One repository's group of open Jules PRs, for the PRs tab.
+struct RepoPrGroup {
+    owner: String,
+    repo: String,
+    prs: Vec<PrView>,
+}
+
+impl RepoPrGroup {
+    /// `owner/repo` label used as the panel heading and confirmation target.
+    fn label(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+/// The outcome of closing one PR during a mass-close.
+struct CloseOutcome {
+    number: u64,
+    title: String,
+    ok: bool,
+    message: String,
+}
+
+/// Current wall-clock time as whole seconds since the Unix epoch.
+fn current_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Distinct `(owner, repo)` pairs parsed from the source labels. Only labels
+/// shaped exactly like `owner/repo` (a single slash, both parts non-empty) are
+/// scanned; display-name labels are skipped.
+fn distinct_repos(labels: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut set: BTreeSet<(String, String)> = BTreeSet::new();
+    for label in labels.values() {
+        if let Some((owner, repo)) = label.split_once('/') {
+            if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
+                set.insert((owner.to_string(), repo.to_string()));
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Parse an RFC3339 `YYYY-MM-DDTHH:MM:SS...` timestamp to whole seconds since
+/// the Unix epoch, using a pure civil-date calculation (no date dependency).
+/// Returns `None` for values that do not match the fixed layout.
+fn rfc3339_to_unix(timestamp: &str) -> Option<i64> {
+    if timestamp.len() < 19 {
+        return None;
+    }
+    let year: i64 = timestamp.get(0..4)?.parse().ok()?;
+    let month: i64 = timestamp.get(5..7)?.parse().ok()?;
+    let day: i64 = timestamp.get(8..10)?.parse().ok()?;
+    let hour: i64 = timestamp.get(11..13)?.parse().ok()?;
+    let minute: i64 = timestamp.get(14..16)?.parse().ok()?;
+    let second: i64 = timestamp.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // Days-from-civil (Howard Hinnant), epoch shifted to 0000-03-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let year_of_era = y - era * 400;
+    let month_shift = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_shift + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Compact age string for a PR created at `created_at`, relative to `now_unix`.
+/// Sub-day ages render as `Nh`, longer ages as `Nd`. Unparseable timestamps
+/// render as `?`.
+fn pr_age(created_at: &str, now_unix: u64) -> String {
+    let Some(created) = rfc3339_to_unix(created_at) else {
+        return "?".to_string();
+    };
+    let now = i64::try_from(now_unix).unwrap_or(i64::MAX);
+    let diff = now - created;
+    if diff <= 0 {
+        return "0h".to_string();
+    }
+    let hours = diff / 3_600;
+    if hours < 24 {
+        format!("{hours}h")
+    } else {
+        format!("{}d", hours / 24)
+    }
+}
+
+/// Convert a fetched [`Pr`] into a renderable [`PrView`].
+fn pr_view(pr: &Pr, now_unix: u64) -> PrView {
+    PrView {
+        number: pr.number,
+        title: pr.title.clone(),
+        age: pr_age(&pr.created_at, now_unix),
+        html_url: pr.html_url.clone(),
+    }
+}
+
+/// Fetch open pulls for each repo in parallel (bounded concurrency), filter to
+/// Jules PRs, and group by repo. Repos that error or have zero Jules PRs are
+/// omitted. Groups are sorted by descending Jules-PR count, then repo label.
+async fn fetch_pr_groups(
+    github: Arc<GithubClient>,
+    matcher: &JulesMatcher,
+    repos: Vec<(String, String)>,
+    now_unix: u64,
+) -> Vec<RepoPrGroup> {
+    let mut groups: Vec<RepoPrGroup> = Vec::new();
+
+    for chunk in repos.chunks(PR_FETCH_CONCURRENCY) {
+        let mut set: JoinSet<(String, String, Result<Vec<Pr>, crate::github::GithubError>)> =
+            JoinSet::new();
+        for (owner, repo) in chunk {
+            let github = Arc::clone(&github);
+            let owner = owner.clone();
+            let repo = repo.clone();
+            set.spawn(async move {
+                let result = github.list_open_pulls(&owner, &repo).await;
+                (owner, repo, result)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let Ok((owner, repo, Ok(prs))) = joined else {
+                continue;
+            };
+            let mut views: Vec<PrView> = prs
+                .iter()
+                .filter(|pr| matcher.is_jules(pr))
+                .map(|pr| pr_view(pr, now_unix))
+                .collect();
+            if views.is_empty() {
+                continue;
+            }
+            // Newest PR number first within a repo.
+            views.sort_by(|a, b| b.number.cmp(&a.number));
+            groups.push(RepoPrGroup { owner, repo, prs: views });
+        }
+    }
+
+    groups.sort_by(|a, b| {
+        b.prs
+            .len()
+            .cmp(&a.prs.len())
+            .then_with(|| a.label().cmp(&b.label()))
+    });
+    groups
+}
+
+/// Close each target PR (bounded concurrency), optionally deleting its head
+/// branch, and collect a per-PR outcome. Outcomes are returned sorted by PR
+/// number ascending.
+async fn close_prs(
+    github: Arc<GithubClient>,
+    owner: &str,
+    repo: &str,
+    targets: Vec<Pr>,
+    delete_branches: bool,
+) -> Vec<CloseOutcome> {
+    let mut outcomes: Vec<CloseOutcome> = Vec::new();
+
+    for chunk in targets.chunks(PR_CLOSE_CONCURRENCY) {
+        let mut set: JoinSet<CloseOutcome> = JoinSet::new();
+        for pr in chunk {
+            let github = Arc::clone(&github);
+            let owner = owner.to_string();
+            let repo = repo.to_string();
+            let number = pr.number;
+            let title = pr.title.clone();
+            let head_ref = pr.head_ref.clone();
+            set.spawn(async move {
+                match github.close_pull(&owner, &repo, number).await {
+                    Ok(()) => {
+                        if delete_branches {
+                            if let Err(error) =
+                                github.delete_branch(&owner, &repo, &head_ref).await
+                            {
+                                return CloseOutcome {
+                                    number,
+                                    title,
+                                    ok: true,
+                                    message: format!("closed · branch delete failed: {error}"),
+                                };
+                            }
+                        }
+                        CloseOutcome {
+                            number,
+                            title,
+                            ok: true,
+                            message: "closed".to_string(),
+                        }
+                    }
+                    Err(error) => CloseOutcome {
+                        number,
+                        title,
+                        ok: false,
+                        message: error.to_string(),
+                    },
+                }
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok(outcome) = joined {
+                outcomes.push(outcome);
+            }
+        }
+    }
+
+    outcomes.sort_by_key(|outcome| outcome.number);
+    outcomes
+}
+
+/// Pluralized "PR"/"PRs" label for a count.
+fn pr_word(count: usize) -> &'static str {
+    if count == 1 { "PR" } else { "PRs" }
+}
+
+/// Render the PRs tab body from already-fetched data.
+fn render_prs(groups: &[RepoPrGroup], has_token: bool) -> Markup {
+    if !has_token {
+        return html! {
+            section class="panel pr-notice" {
+                h2 { "Jules PR management" }
+                p {
+                    "Set " code { "GITHUB_TOKEN" } " in the server environment to enable "
+                    "Jules PR management."
+                }
+                p class="muted" {
+                    "Once a token is present this tab lists every open Jules-authored PR per "
+                    "repository and lets you close them all with one guarded click. Identification "
+                    "is configurable via " code { "JULES_PR_AUTHORS" } " (comma-separated author "
+                    "logins) and " code { "JULES_PR_MARKER" } " (a PR-body substring)."
+                }
+            }
+        };
+    }
+
+    let total: usize = groups.iter().map(|group| group.prs.len()).sum();
+
+    html! {
+        @if groups.is_empty() {
+            section class="panel" {
+                p class="empty" {
+                    "No open Jules PRs found across your repositories. Nice and clean."
+                }
+            }
+        } @else {
+            section class="panel pr-headline" {
+                h2 {
+                    (total) " open Jules " (pr_word(total)) " across "
+                    (groups.len()) " " (if groups.len() == 1 { "repo" } else { "repos" })
+                }
+                p class="muted" {
+                    "Close every Jules-authored PR in a repo with one guarded click. The server "
+                    "re-lists and re-classifies each PR before closing, so a non-Jules PR is never "
+                    "touched — even if this page is stale."
+                }
+            }
+            @for group in groups {
+                (render_pr_group(group))
+            }
+        }
+    }
+}
+
+/// Render one repository's panel: a count badge, the PR list (capped), and the
+/// guarded type-to-confirm close-all form.
+fn render_pr_group(group: &RepoPrGroup) -> Markup {
+    let count = group.prs.len();
+    let target = group.label();
+    let hidden = count.saturating_sub(PR_LIST_CAP);
+
+    html! {
+        section class="panel pr-panel" {
+            div class="pr-panel-head" {
+                span class="pr-repo mono" { (target) }
+                span class="pr-badge" { (count) " Jules " (pr_word(count)) }
+            }
+            div class="pr-list" {
+                @for pr in group.prs.iter().take(PR_LIST_CAP) {
+                    div class="pr-row" {
+                        span class="pr-num mono muted" { "#" (pr.number) }
+                        a class="pr-title" href=(pr.html_url) target="_blank" rel="noreferrer" {
+                            (truncate(&pr.title, 90))
+                        }
+                        span class="pr-age mono muted" { (pr.age) }
+                    }
+                }
+            }
+            @if hidden > 0 {
+                p class="muted pr-more" { "+" (hidden) " more not shown" }
+            }
+            details class="pr-confirm" {
+                summary class="pr-toggle" {
+                    "Close all " (count) " Jules " (pr_word(count)) " in this repo"
+                }
+                form class="pr-form" method="post" action="/prs/close-all" {
+                    input type="hidden" name="owner" value=(group.owner);
+                    input type="hidden" name="repo" value=(group.repo);
+                    p class="pr-warn" {
+                        "This permanently closes " (count) " open pull " (pr_word(count))
+                        " in " strong { (target) } ". This cannot be undone from here."
+                    }
+                    label class="pr-confirm-label" {
+                        "Type " code { (target) } " to confirm:"
+                        input class="pr-confirm-input" type="text" name="confirm"
+                            autocomplete="off" spellcheck="false"
+                            data-expect=(target) placeholder=(target);
+                    }
+                    label class="pr-branch-label" {
+                        input type="checkbox" name="delete_branches" value="on";
+                        " Also delete the head branches"
+                    }
+                    button type="submit" class="pr-danger-btn" disabled {
+                        "Close " (count) " " (pr_word(count))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Results page after a mass-close: headline counts and a per-PR line.
+fn render_close_result(target: &str, delete_branches: bool, outcomes: &[CloseOutcome]) -> Markup {
+    let closed = outcomes.iter().filter(|outcome| outcome.ok).count();
+    let failed = outcomes.len() - closed;
+
+    page_shell(
+        "Jules Dashboard — close results",
+        &html! {
+            header class="topbar" {
+                h1 { "Jules Dashboard" }
+            }
+            section class="panel" {
+                h2 { "Closed Jules PRs in " (target) }
+                p class="pr-result-summary" {
+                    span class="pr-ok" { (closed) " closed" }
+                    " · "
+                    span class=(if failed > 0 { "pr-fail" } else { "muted" }) { (failed) " failed" }
+                }
+                @if delete_branches {
+                    p class="muted" { "Head branch deletion was requested for each closed PR." }
+                }
+                @if outcomes.is_empty() {
+                    p class="muted" { "No Jules PRs were open in this repo at close time." }
+                } @else {
+                    div class="pr-list" {
+                        @for outcome in outcomes {
+                            div class="pr-row" {
+                                span class="pr-num mono muted" { "#" (outcome.number) }
+                                span class="pr-title" { (truncate(&outcome.title, 80)) }
+                                span class=(if outcome.ok { "pr-ok" } else { "pr-fail" }) {
+                                    (outcome.message)
+                                }
+                            }
+                        }
+                    }
+                }
+                p class="pr-back" { a href="/?tab=prs" { "← Back to PRs" } }
+            }
+        },
+        false,
+    )
+}
+
+/// Error results page for a rejected or failed mass-close (no auto-refresh).
+fn render_close_error(message: &str) -> Markup {
+    page_shell(
+        "Jules Dashboard — close error",
+        &html! {
+            header class="topbar" {
+                h1 { "Jules Dashboard" }
+            }
+            div class="error-card" {
+                h2 { "Nothing was closed" }
+                p { (message) }
+                p class="pr-back" { a href="/?tab=prs" { "← Back to PRs" } }
+            }
+        },
+        false,
+    )
+}
+
 /// Inline stylesheet for the dashboard (dark theme).
 const STYLES: &str = r"
 :root { color-scheme: dark; }
@@ -1408,6 +1951,108 @@ a:hover { text-decoration: underline; }
 .kill:hover { color: #ef4444; background: #ef444422; border-color: #ef444455; }
 .kill.armed { color: #fff; background: #ef4444; border-color: #ef4444; font-weight: 700; }
 .kill:disabled { opacity: 0.55; cursor: default; }
+.pr-notice h2 { color: #e2e8f0; }
+.pr-notice code, .pr-panel code, .pr-form code {
+    background: #0b1120;
+    border: 1px solid #1e293b;
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #7dd3fc;
+}
+.pr-headline h2 { color: #e2e8f0; font-size: 18px; }
+.pr-panel { padding: 16px 20px; }
+.pr-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.pr-repo { font-size: 14px; color: #e2e8f0; }
+.pr-badge {
+    background: #3b82f622;
+    color: #93c5fd;
+    border: 1px solid #3b82f655;
+    border-radius: 999px;
+    padding: 3px 11px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+.pr-list { display: flex; flex-direction: column; gap: 4px; }
+.pr-row {
+    display: grid;
+    grid-template-columns: 56px 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 8px;
+    border-bottom: 1px solid #16203a;
+}
+.pr-num { text-align: right; }
+.pr-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.pr-age { white-space: nowrap; }
+.pr-more { margin: 8px 0 0; font-size: 12px; }
+.pr-confirm { margin-top: 14px; }
+.pr-toggle {
+    cursor: pointer;
+    display: inline-block;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #fca5a5;
+    background: #2a1216;
+    border: 1px solid #7f1d1d;
+    list-style: none;
+}
+.pr-toggle::-webkit-details-marker { display: none; }
+.pr-toggle:hover { background: #3a1a1f; }
+.pr-form {
+    margin-top: 12px;
+    padding: 16px;
+    border: 1px solid #7f1d1d;
+    border-radius: 10px;
+    background: #1a0e11;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 560px;
+}
+.pr-warn { margin: 0; font-size: 13px; color: #fecaca; line-height: 1.5; }
+.pr-warn strong { color: #fff; }
+.pr-confirm-label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: #e2e8f0; }
+.pr-confirm-input {
+    background: #0b1120;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    padding: 9px 11px;
+    color: #e2e8f0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+}
+.pr-confirm-input:focus { outline: none; border-color: #ef4444; }
+.pr-branch-label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; }
+.pr-danger-btn {
+    align-self: flex-start;
+    padding: 9px 18px;
+    border-radius: 8px;
+    border: 1px solid #ef4444;
+    background: #ef4444;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+}
+.pr-danger-btn:hover:enabled { background: #dc2626; }
+.pr-danger-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.pr-result-summary { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.pr-ok { color: #22c55e; }
+.pr-fail { color: #ef4444; }
+.pr-back { margin-top: 18px; }
 ";
 
 /// Inline script powering the per-row ✕ delete control. First click *arms* the
@@ -1459,6 +2104,23 @@ const DELETE_SCRIPT: &str = r#"
     });
 })();
 "#;
+
+/// Inline script for the type-to-confirm mass-close form. The destructive
+/// submit button stays disabled until the text input's value exactly matches
+/// the panel's `owner/repo` (carried in `data-expect`). Server-side validation
+/// re-checks this, so the script is a UX guard, not the safety boundary.
+const PR_CONFIRM_SCRIPT: &str = r"
+(function () {
+    document.addEventListener('input', function (e) {
+        var input = e.target.closest('.pr-confirm-input');
+        if (!input) { return; }
+        var form = input.closest('form');
+        var btn = form ? form.querySelector('.pr-danger-btn') : null;
+        if (!btn) { return; }
+        btn.disabled = input.value.trim() !== input.dataset.expect;
+    });
+})();
+";
 
 #[cfg(test)]
 mod tests {
@@ -1825,6 +2487,160 @@ mod tests {
         assert!(html.contains("Ultra plan limit"));
     }
 
+    #[test]
+    fn rfc3339_to_unix_matches_known_epochs() {
+        // 2026-07-16T00:00:00Z is 1_784_160_000 seconds since the epoch.
+        assert_eq!(rfc3339_to_unix("2026-07-16T00:00:00Z"), Some(1_784_160_000));
+        assert_eq!(rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_to_unix("1970-01-02T00:00:01Z"), Some(86_401));
+        // Malformed / out-of-range inputs are rejected.
+        assert_eq!(rfc3339_to_unix("nope"), None);
+        assert_eq!(rfc3339_to_unix("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn pr_age_uses_hours_then_days() {
+        let base = 1_784_160_000_u64; // 2026-07-16T00:00:00Z
+        // Same instant → 0h.
+        assert_eq!(pr_age("2026-07-16T00:00:00Z", base), "0h");
+        // 5 hours old.
+        assert_eq!(pr_age(&unix_to_rfc3339(base - 5 * 3_600), base), "5h");
+        // 3 days old.
+        assert_eq!(pr_age(&unix_to_rfc3339(base - 3 * 86_400), base), "3d");
+        // Future timestamps clamp to 0h, unparseable to ?.
+        assert_eq!(pr_age("2030-01-01T00:00:00Z", base), "0h");
+        assert_eq!(pr_age("garbage", base), "?");
+    }
+
+    /// Helper: round-trip a unix time back to RFC3339 for age tests, reusing the
+    /// same civil-date math the parser inverts.
+    fn unix_to_rfc3339(secs: u64) -> String {
+        let secs = i64::try_from(secs).unwrap();
+        let days = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (hour, minute, second) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if month <= 2 { year + 1 } else { year };
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    }
+
+    #[test]
+    fn distinct_repos_parses_owner_repo_labels_only() {
+        let mut labels = BTreeMap::new();
+        labels.insert("sources/a".to_string(), "acme/api".to_string());
+        labels.insert("sources/b".to_string(), "acme/api".to_string()); // dup
+        labels.insert("sources/c".to_string(), "octo/cat".to_string());
+        labels.insert("sources/d".to_string(), "just-a-display-name".to_string());
+        labels.insert("sources/e".to_string(), "too/many/slashes".to_string());
+        let repos = distinct_repos(&labels);
+        assert_eq!(
+            repos,
+            vec![
+                ("acme".to_string(), "api".to_string()),
+                ("octo".to_string(), "cat".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prs_tab_without_token_shows_setup_notice() {
+        let html = render_prs(&[], false).into_string();
+        assert!(html.contains("GITHUB_TOKEN"));
+        assert!(html.contains("JULES_PR_AUTHORS"));
+    }
+
+    #[test]
+    fn prs_tab_with_token_empty_shows_clean_state() {
+        let html = render_prs(&[], true).into_string();
+        assert!(html.contains("No open Jules PRs"));
+    }
+
+    #[test]
+    fn prs_tab_renders_groups_and_confirm_form() {
+        let groups = sample_pr_groups();
+        let html = render_prs_dashboard(&groups, true).into_string();
+        // Tab nav shows PRs active, and no auto-refresh meta on this tab.
+        assert!(html.contains("/?tab=prs"));
+        assert!(!html.contains(r#"http-equiv="refresh""#));
+        // Headline + a repo panel with a count badge.
+        assert!(html.contains("open Jules"));
+        assert!(html.contains("acme/api"));
+        assert!(html.contains("Jules PRs"));
+        // The guarded close form: hidden fields, type-to-confirm input, disabled
+        // destructive button, and the branch-delete checkbox.
+        assert!(html.contains(r#"action="/prs/close-all""#));
+        assert!(html.contains(r#"name="confirm""#));
+        assert!(html.contains(r#"data-expect="acme/api""#));
+        assert!(html.contains(r#"name="delete_branches""#));
+        assert!(html.contains("<button type=\"submit\" class=\"pr-danger-btn\" disabled"));
+    }
+
+    #[test]
+    fn close_result_page_summarizes_outcomes() {
+        let outcomes = vec![
+            CloseOutcome {
+                number: 10,
+                title: "nova: a".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 11,
+                title: "nova: b".to_string(),
+                ok: false,
+                message: "github API error 403: nope".to_string(),
+            },
+        ];
+        let html = render_close_result("acme/api", false, &outcomes).into_string();
+        assert!(html.contains("1 closed"));
+        assert!(html.contains("1 failed"));
+        assert!(html.contains("/?tab=prs"));
+        assert!(!html.contains(r#"http-equiv="refresh""#));
+    }
+
+    /// Sample PR groups for the demo screenshot and the render tests.
+    fn sample_pr_groups() -> Vec<RepoPrGroup> {
+        let view = |number: u64, title: &str, age: &str| PrView {
+            number,
+            title: title.to_string(),
+            age: age.to_string(),
+            html_url: format!("https://github.com/acme/api/pull/{number}"),
+        };
+        vec![
+            RepoPrGroup {
+                owner: "acme".to_string(),
+                repo: "api".to_string(),
+                prs: vec![
+                    view(4321, "nova: bump serde and tidy imports", "2h"),
+                    view(4319, "jules: add retry backoff to the poller", "6h"),
+                    view(4302, "feature/rename config keys for clarity", "1d"),
+                    view(4288, "nova/refactor the session cache layer", "3d"),
+                ],
+            },
+            RepoPrGroup {
+                owner: "acme".to_string(),
+                repo: "web".to_string(),
+                prs: vec![
+                    view(210, "jules-tidy the dashboard styles", "4h"),
+                    view(205, "nova: extract the header component", "2d"),
+                ],
+            },
+            RepoPrGroup {
+                owner: "octo".to_string(),
+                repo: "cat".to_string(),
+                prs: vec![view(77, "jules: document the deploy flow", "5d")],
+            },
+        ]
+    }
+
     /// Renders the dashboard with a synthetic dataset and writes it to disk for
     /// manual/visual inspection. Ignored by default; run with:
     /// `cargo test --features web -- --ignored render_demo_dashboard --nocapture`
@@ -1907,11 +2723,18 @@ mod tests {
         }
 
         // Render the tab named by DEMO_TAB (default: the In Progress landing view).
-        let params = IndexParams {
-            tab: std::env::var("DEMO_TAB").ok(),
-            ..IndexParams::default()
+        // The PRs tab needs network-fetched data in the live server, so here it
+        // renders from sample groups (with the confirm form visible) instead.
+        let demo_tab = std::env::var("DEMO_TAB").ok();
+        let html = if demo_tab.as_deref() == Some("prs") {
+            render_prs_dashboard(&sample_pr_groups(), true).into_string()
+        } else {
+            let params = IndexParams {
+                tab: demo_tab,
+                ..IndexParams::default()
+            };
+            render_dashboard(&sessions, &labels, &params).into_string()
         };
-        let html = render_dashboard(&sessions, &labels, &params).into_string();
 
         let out = std::env::var("DEMO_OUT").unwrap_or_else(|_| "dashboard.html".to_string());
         std::fs::write(&out, html).expect("write dashboard html");
