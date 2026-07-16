@@ -536,3 +536,129 @@ async fn delete_completed_sessions_rejects_duplicate_next_page_token() {
         other => panic!("expected JulesError::InvalidArgument, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn delete_stale_queued_sessions_deletes_only_stale_queued_across_pages() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param_is_missing("pageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-1",
+                    "state": "QUEUED",
+                    "createTime": "2000-01-01T00:00:00Z"
+                },
+                {
+                    "name": "sessions/s-2",
+                    "state": "QUEUED",
+                    "createTime": "2999-01-01T00:00:00Z"
+                }
+            ],
+            "nextPageToken": "cursor-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .and(query_param("pageToken", "cursor-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-3",
+                    "state": "QUEUED",
+                    "createTime": "2001-06-15T12:00:00Z"
+                },
+                {
+                    "name": "sessions/s-4",
+                    "state": "COMPLETED",
+                    "createTime": "2000-01-01T00:00:00Z"
+                },
+                {
+                    "name": "sessions/s-5",
+                    "state": "QUEUED"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1alpha/sessions/s-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/v1alpha/sessions/s-3"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = JulesClient::builder("test-api-key")
+        .base_url(format!("{}/v1alpha", server.uri()))
+        .build()
+        .expect("build test client");
+
+    let deleted_sessions = client
+        .delete_stale_queued_sessions(Duration::from_secs(24 * 60 * 60))
+        .await
+        .expect("delete stale queued sessions succeeds");
+
+    assert_eq!(
+        deleted_sessions,
+        vec!["sessions/s-1".to_string(), "sessions/s-3".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn delete_stale_queued_sessions_returns_empty_when_none_stale() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1alpha/sessions"))
+        .and(query_param("pageSize", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sessions": [
+                {
+                    "name": "sessions/s-1",
+                    "state": "QUEUED",
+                    "createTime": "2999-01-01T00:00:00Z"
+                },
+                {
+                    "name": "sessions/s-2",
+                    "state": "IN_PROGRESS",
+                    "createTime": "2000-01-01T00:00:00Z"
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = JulesClient::builder("test-api-key")
+        .base_url(format!("{}/v1alpha", server.uri()))
+        .build()
+        .expect("build test client");
+
+    let deleted_sessions = client
+        .delete_stale_queued_sessions(Duration::from_secs(24 * 60 * 60))
+        .await
+        .expect("delete stale queued sessions succeeds");
+    assert!(deleted_sessions.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("read received requests");
+    assert_eq!(requests.len(), 1, "only listing call should be issued");
+}
