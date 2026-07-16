@@ -170,6 +170,14 @@ impl GithubClient {
             .header("User-Agent", USER_AGENT)
     }
 
+    /// Build a [`GithubError::Api`] from a non-success response, reading the body
+    /// (best-effort) for diagnostics.
+    async fn api_error(response: reqwest::Response) -> GithubError {
+        let status = response.status().as_u16();
+        let message = response.text().await.unwrap_or_default();
+        GithubError::Api { status, message }
+    }
+
     /// List every open pull request for `owner/repo`, paginating until a short
     /// page is returned. This endpoint (unlike the search API) includes each
     /// PR's `body`, `user.login`, and `head.ref`, which the Jules matcher needs.
@@ -187,13 +195,8 @@ impl GithubClient {
                 self.base_url
             );
             let response = self.authorized(self.http.get(&url)).send().await?;
-            let status = response.status();
-            if !status.is_success() {
-                let message = response.text().await.unwrap_or_default();
-                return Err(GithubError::Api {
-                    status: status.as_u16(),
-                    message,
-                });
+            if !response.status().is_success() {
+                return Err(Self::api_error(response).await);
             }
             let prs: Vec<Pr> = response.json().await?;
             let received = prs.len();
@@ -219,15 +222,10 @@ impl GithubClient {
             .json(&serde_json::json!({ "state": "closed" }))
             .send()
             .await?;
-        let status = response.status();
-        if status.is_success() {
+        if response.status().is_success() {
             Ok(())
         } else {
-            let message = response.text().await.unwrap_or_default();
-            Err(GithubError::Api {
-                status: status.as_u16(),
-                message,
-            })
+            Err(Self::api_error(response).await)
         }
     }
 
@@ -249,15 +247,10 @@ impl GithubClient {
             self.base_url
         );
         let response = self.authorized(self.http.delete(&url)).send().await?;
-        let status = response.status();
-        if status.is_success() || matches!(status.as_u16(), 404 | 422) {
+        if response.status().is_success() || matches!(response.status().as_u16(), 404 | 422) {
             Ok(())
         } else {
-            let message = response.text().await.unwrap_or_default();
-            Err(GithubError::Api {
-                status: status.as_u16(),
-                message,
-            })
+            Err(Self::api_error(response).await)
         }
     }
 }
@@ -288,11 +281,7 @@ impl JulesMatcher {
             .ok()
             .filter(|raw| !raw.trim().is_empty())
             .map_or_else(
-                || {
-                    let mut set = HashSet::new();
-                    set.insert(DEFAULT_JULES_AUTHOR.to_string());
-                    set
-                },
+                || HashSet::from([DEFAULT_JULES_AUTHOR.to_string()]),
                 |raw| {
                     raw.split(',')
                         .map(|login| login.trim().to_string())
@@ -334,10 +323,8 @@ mod tests {
 
     /// A minimal Jules matcher with fixed config (no env dependency).
     fn matcher() -> JulesMatcher {
-        let mut author_logins = HashSet::new();
-        author_logins.insert("google-labs-jules[bot]".to_string());
         JulesMatcher {
-            author_logins,
+            author_logins: HashSet::from(["google-labs-jules[bot]".to_string()]),
             marker: DEFAULT_JULES_MARKER.to_lowercase(),
         }
     }
