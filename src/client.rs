@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{fmt, fmt::Formatter};
 
 use reqwest::{Client, Request, RequestBuilder, Url};
@@ -178,6 +178,73 @@ impl JulesClient {
 
             for session in response.sessions {
                 if session.state == Some(SessionState::Completed) {
+                    let session_name = session.name;
+                    self.delete_session(&session_name).await?;
+                    deleted_sessions.push(session_name);
+                }
+            }
+
+            match response.next_page_token.filter(|token| !token.is_empty()) {
+                Some(next_page_token) => {
+                    if !seen_page_tokens.insert(next_page_token.clone()) {
+                        return Err(JulesError::InvalidArgument(format!(
+                            "duplicate next_page_token returned by API: `{next_page_token}`"
+                        )));
+                    }
+                    page_token = Some(next_page_token);
+                }
+                None => break,
+            }
+        }
+
+        Ok(deleted_sessions)
+    }
+
+    /// Deletes stale sessions stuck in the `QUEUED` state.
+    ///
+    /// A session is considered stale when its `create_time` is older than
+    /// `now - max_age`. Deleting these reaps "zombie" sessions that never
+    /// leave the queue and would otherwise count against the concurrent
+    /// session cap indefinitely.
+    ///
+    /// Timestamps are compared lexicographically as RFC 3339 strings against a
+    /// UTC cutoff derived from the system clock. This is exact for the
+    /// canonical `...Z` timestamps returned by the API; the only ambiguity is
+    /// at sub-second boundaries of the exact cutoff instant, which is
+    /// irrelevant for the hour/day-scale thresholds this is used with.
+    /// Sessions whose `create_time` is absent are left untouched.
+    ///
+    /// Returns the resource names for sessions that were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JulesError`] if listing pages fails, a deletion fails, or
+    /// transport/API errors occur.
+    pub async fn delete_stale_queued_sessions(
+        &self,
+        max_age: Duration,
+    ) -> Result<Vec<String>, JulesError> {
+        let cutoff = rfc3339_cutoff(max_age);
+        let mut deleted_sessions = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = HashSet::new();
+
+        loop {
+            let response = self
+                .list_sessions(ListSessionsParams {
+                    page_size: Some(MAX_PAGE_SIZE),
+                    page_token,
+                    filter: None,
+                })
+                .await?;
+
+            for session in response.sessions {
+                let is_stale_queued = session.state == Some(SessionState::Queued)
+                    && session
+                        .create_time
+                        .as_deref()
+                        .is_some_and(|create_time| create_time < cutoff.as_str());
+                if is_stale_queued {
                     let session_name = session.name;
                     self.delete_session(&session_name).await?;
                     deleted_sessions.push(session_name);
@@ -560,6 +627,46 @@ fn validate_page_size(page_size: Option<u32>) -> Result<(), JulesError> {
         }
     }
     Ok(())
+}
+
+/// Formats the UTC cutoff instant `now - max_age` as an RFC 3339 string
+/// suitable for lexicographic comparison against session `create_time` values.
+fn rfc3339_cutoff(max_age: Duration) -> String {
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let cutoff_secs = since_epoch.saturating_sub(max_age).as_secs();
+    unix_seconds_to_rfc3339(i64::try_from(cutoff_secs).unwrap_or(i64::MAX))
+}
+
+/// Converts a count of seconds since the Unix epoch to a UTC RFC 3339 string
+/// (`YYYY-MM-DDTHH:MM:SSZ`) using a pure-arithmetic civil-date conversion, so
+/// no date/time dependency is required.
+fn unix_seconds_to_rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let hour = time_of_day / 3_600;
+    let minute = (time_of_day % 3_600) / 60;
+    let second = time_of_day % 60;
+
+    // Days-to-civil algorithm (Howard Hinnant), epoch shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_pos = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_pos + 2) / 5 + 1;
+    let month = if month_pos < 10 {
+        month_pos + 3
+    } else {
+        month_pos - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), JulesError> {
