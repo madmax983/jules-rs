@@ -473,6 +473,21 @@ impl JulesMatcher {
         }
     }
 
+    /// The configured author logins, sorted and comma-joined, for diagnostics
+    /// (for example the "nothing matched" banner on the close-all results page).
+    #[must_use]
+    pub fn authors_display(&self) -> String {
+        let mut logins: Vec<&str> = self.author_logins.iter().map(String::as_str).collect();
+        logins.sort_unstable();
+        logins.join(", ")
+    }
+
+    /// The configured (lowercased) body marker, for diagnostics.
+    #[must_use]
+    pub fn marker_display(&self) -> &str {
+        &self.marker
+    }
+
     /// Whether `pr` looks Jules-authored: author-login match OR body-marker
     /// match OR a Jules task permalink in the body.
     #[must_use]
