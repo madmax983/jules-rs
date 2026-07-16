@@ -173,23 +173,31 @@ async fn fetch_all_sources(client: &JulesClient) -> Result<Vec<Source>, JulesErr
     Ok(all)
 }
 
-/// Return every session, served from the short-TTL cache when a recent fetch is
-/// still fresh and re-fetching (then caching) otherwise. The mutex guard is
-/// always dropped before the `await`, so no lock is held across the network call.
-async fn cached_sessions(context: &WebContext) -> Result<Arc<Vec<Session>>, JulesError> {
+/// Serve an `Option`-slot cache: return the cached value while it is still fresh,
+/// otherwise run `fetch`, store the result in the slot `slot` selects, and return
+/// it. The mutex guard is always dropped before `fetch.await`, so no lock is held
+/// across the network call. Backs [`cached_sessions`] and [`cached_sources`].
+async fn cached_slot<T, Fut>(
+    cache: &Mutex<DashboardCache>,
+    slot: impl for<'a> Fn(&'a mut DashboardCache) -> &'a mut Option<TimedCache<Arc<T>>>,
+    fetch: Fut,
+) -> Result<Arc<T>, JulesError>
+where
+    Fut: std::future::Future<Output = Result<T, JulesError>>,
+{
     let now = Instant::now();
     {
-        let cache = lock_cache(&context.cache);
-        if let Some(entry) = &cache.sessions {
+        let mut guard = lock_cache(cache);
+        if let Some(entry) = slot(&mut guard) {
             if is_fresh(entry.fetched_at, now, CACHE_TTL) {
                 return Ok(Arc::clone(&entry.value));
             }
         }
     }
-    let fresh = Arc::new(fetch_all_sessions(&context.client).await?);
+    let fresh = Arc::new(fetch.await?);
     {
-        let mut cache = lock_cache(&context.cache);
-        cache.sessions = Some(TimedCache {
+        let mut guard = lock_cache(cache);
+        *slot(&mut guard) = Some(TimedCache {
             fetched_at: Instant::now(),
             value: Arc::clone(&fresh),
         });
@@ -197,27 +205,27 @@ async fn cached_sessions(context: &WebContext) -> Result<Arc<Vec<Session>>, Jule
     Ok(fresh)
 }
 
+/// Return every session, served from the short-TTL cache when a recent fetch is
+/// still fresh and re-fetching (then caching) otherwise. The mutex guard is
+/// always dropped before the `await`, so no lock is held across the network call.
+async fn cached_sessions(context: &WebContext) -> Result<Arc<Vec<Session>>, JulesError> {
+    cached_slot(
+        &context.cache,
+        |cache| &mut cache.sessions,
+        fetch_all_sessions(&context.client),
+    )
+    .await
+}
+
 /// Return every source, served from the short-TTL cache when fresh. Mirrors
 /// [`cached_sessions`]; the lock is never held across the `await`.
 async fn cached_sources(context: &WebContext) -> Result<Arc<Vec<Source>>, JulesError> {
-    let now = Instant::now();
-    {
-        let cache = lock_cache(&context.cache);
-        if let Some(entry) = &cache.sources {
-            if is_fresh(entry.fetched_at, now, CACHE_TTL) {
-                return Ok(Arc::clone(&entry.value));
-            }
-        }
-    }
-    let fresh = Arc::new(fetch_all_sources(&context.client).await?);
-    {
-        let mut cache = lock_cache(&context.cache);
-        cache.sources = Some(TimedCache {
-            fetched_at: Instant::now(),
-            value: Arc::clone(&fresh),
-        });
-    }
-    Ok(fresh)
+    cached_slot(
+        &context.cache,
+        |cache| &mut cache.sources,
+        fetch_all_sources(&context.client),
+    )
+    .await
 }
 
 /// List one repo's open pulls, served from the short-TTL cache when fresh. Used
@@ -225,24 +233,24 @@ async fn cached_sources(context: &WebContext) -> Result<Arc<Vec<Source>>, JulesE
 /// live (uncached) so its re-classification is authoritative. The lock is never
 /// held across the `await`.
 async fn cached_open_pulls(
-    github: Arc<GithubClient>,
-    cache: Arc<Mutex<DashboardCache>>,
-    owner: String,
-    repo: String,
+    github: &GithubClient,
+    cache: &Mutex<DashboardCache>,
+    owner: &str,
+    repo: &str,
 ) -> Result<Arc<Vec<Pr>>, crate::github::GithubError> {
-    let key = (owner.clone(), repo.clone());
+    let key = (owner.to_string(), repo.to_string());
     let now = Instant::now();
     {
-        let guard = lock_cache(&cache);
+        let guard = lock_cache(cache);
         if let Some(entry) = guard.prs.get(&key) {
             if is_fresh(entry.fetched_at, now, CACHE_TTL) {
                 return Ok(Arc::clone(&entry.value));
             }
         }
     }
-    let fresh = Arc::new(github.list_open_pulls(&owner, &repo).await?);
+    let fresh = Arc::new(github.list_open_pulls(owner, repo).await?);
     {
-        let mut guard = lock_cache(&cache);
+        let mut guard = lock_cache(cache);
         guard.prs.insert(
             key,
             TimedCache {
@@ -1722,8 +1730,7 @@ async fn fetch_pr_groups(
             let owner = owner.clone();
             let repo = repo.clone();
             set.spawn(async move {
-                let result =
-                    cached_open_pulls(Arc::clone(&github), cache, owner.clone(), repo.clone()).await;
+                let result = cached_open_pulls(&github, &cache, &owner, &repo).await;
                 (owner, repo, result)
             });
         }
