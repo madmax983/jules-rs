@@ -9,7 +9,7 @@
 //! All aggregation logic lives in small pure functions so it can be unit
 //! tested without any network access.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ pub async fn run() -> Result<(), String> {
         .map_err(|_| "web context was already initialized".to_string())?;
 
     autumn_web::app()
-        .routes(routes![index, api_summary])
+        .routes(routes![index, api_summary, delete_session_route])
         .run()
         .await;
 
@@ -139,6 +139,31 @@ const ALL_STATES: [SessionState; 10] = [
     SessionState::Unknown,
 ];
 
+/// Documented concurrent-task cap on the Jules **Ultra** plan. The API does not
+/// expose the caller's plan, so this is the published Ultra value used as a
+/// reference ceiling rather than a per-account limit.
+const CONCURRENT_CAP: usize = 60;
+
+/// Maximum number of repo rows rendered in the inferred-schedule heatmap. Extra
+/// repos are collapsed into a "N more hidden" note so the grid stays readable.
+const HEATMAP_MAX_ROWS: usize = 12;
+
+/// A (repo, hour) cell is treated as a likely recurring/scheduled pattern once
+/// it has appeared on at least this many distinct calendar dates.
+const RECURRENCE_MIN_DAYS: usize = 2;
+
+/// Active (non-terminal) states in display order, used for the headline
+/// composition breakdown. The union of these is exactly [`is_active_state`], so
+/// the composition always sums to [`count_running`].
+const ACTIVE_STATES: [SessionState; 6] = [
+    SessionState::InProgress,
+    SessionState::Queued,
+    SessionState::AwaitingUserFeedback,
+    SessionState::AwaitingPlanApproval,
+    SessionState::Planning,
+    SessionState::Paused,
+];
+
 /// Whether a state counts as "running right now" (non-terminal, real work).
 fn is_active_state(state: SessionState) -> bool {
     matches!(
@@ -178,6 +203,32 @@ fn count_by_state(sessions: &[Session]) -> Vec<(SessionState, usize)> {
             (count > 0).then_some((state, count))
         })
         .collect()
+}
+
+/// Count sessions currently in a single state.
+fn count_in_state(sessions: &[Session], state: SessionState) -> usize {
+    sessions
+        .iter()
+        .filter(|session| session_state(session) == state)
+        .count()
+}
+
+/// Composition of the active (non-terminal) total: `(state, count)` for each
+/// active state with a non-zero count, in [`ACTIVE_STATES`] display order. The
+/// counts always sum to [`count_running`].
+fn active_composition(sessions: &[Session]) -> Vec<(SessionState, usize)> {
+    ACTIVE_STATES
+        .iter()
+        .filter_map(|&state| {
+            let count = count_in_state(sessions, state);
+            (count > 0).then_some((state, count))
+        })
+        .collect()
+}
+
+/// Percentage (0-100) of the documented concurrent cap currently in use.
+fn cap_pct(active: usize) -> usize {
+    (active * 100 / CONCURRENT_CAP).min(100)
 }
 
 /// Extract a stable `YYYY-MM-DD HH:00` hour-bucket key from an RFC3339
@@ -226,6 +277,115 @@ fn count_by_hour(sessions: &[Session]) -> Vec<(String, usize)> {
         }
     }
     buckets.into_iter().collect()
+}
+
+/// Extract `(date, hour)` from an RFC3339 timestamp, where `date` is the
+/// `YYYY-MM-DD` prefix and `hour` is the UTC hour `0..=23`. Reuses the fixed
+/// layout validated by [`hour_bucket_key`], so malformed or out-of-range values
+/// return `None`.
+fn date_and_hour(timestamp: &str) -> Option<(String, u8)> {
+    // Validate the RFC3339 prefix layout once, then slice out the parts.
+    hour_bucket_key(timestamp)?;
+    let date = timestamp.get(0..10)?.to_string();
+    let hour: u8 = timestamp.get(11..13)?.parse().ok()?;
+    if hour > 23 {
+        return None;
+    }
+    Some((date, hour))
+}
+
+/// A single heatmap cell for one `(repo, hour)`: how many sessions were created
+/// in that hour-of-day, and on how many distinct calendar dates (the recurrence
+/// signal).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HeatCell {
+    /// Total sessions created in this hour-of-day across all history.
+    count: usize,
+    /// Distinct calendar dates those sessions fall on.
+    days: usize,
+}
+
+impl HeatCell {
+    /// Whether this cell looks like a recurring/scheduled pattern.
+    fn is_recurring(self) -> bool {
+        self.days >= RECURRENCE_MIN_DAYS
+    }
+}
+
+/// One repo's row in the inferred-schedule heatmap: 24 hourly cells (index =
+/// UTC hour `0..=23`) plus the row total.
+struct HeatRow {
+    repo: String,
+    cells: [HeatCell; 24],
+    total: usize,
+}
+
+/// Aggregate sessions into per-repo, per-hour heatmap rows (UTC). Only sessions
+/// with a parseable `create_time` contribute. Rows are sorted by descending
+/// total activity, then repo name, so the busiest repos surface first.
+fn heatmap_rows(sessions: &[Session], labels: &BTreeMap<String, String>) -> Vec<HeatRow> {
+    // repo -> per-hour (session count, set of distinct dates)
+    type HourAcc = [(usize, BTreeSet<String>); 24];
+    let mut acc: BTreeMap<String, HourAcc> = BTreeMap::new();
+
+    for session in sessions {
+        let Some(timestamp) = session.create_time.as_deref() else {
+            continue;
+        };
+        let Some((date, hour)) = date_and_hour(timestamp) else {
+            continue;
+        };
+        let repo = repo_label(session, labels);
+        let entry = acc
+            .entry(repo)
+            .or_insert_with(|| std::array::from_fn(|_| (0, BTreeSet::new())));
+        let cell = &mut entry[hour as usize];
+        cell.0 += 1;
+        cell.1.insert(date);
+    }
+
+    let mut rows: Vec<HeatRow> = acc
+        .into_iter()
+        .map(|(repo, hours)| {
+            let cells: [HeatCell; 24] = std::array::from_fn(|h| HeatCell {
+                count: hours[h].0,
+                days: hours[h].1.len(),
+            });
+            let total = cells.iter().map(|cell| cell.count).sum();
+            HeatRow { repo, cells, total }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.repo.cmp(&b.repo)));
+    rows
+}
+
+/// Sum of activity per hour across every repo (index = UTC hour). Drives the
+/// heatmap footer and peak-hour highlighting.
+fn hour_totals(rows: &[HeatRow]) -> [usize; 24] {
+    let mut totals = [0usize; 24];
+    for row in rows {
+        for (total, cell) in totals.iter_mut().zip(row.cells.iter()) {
+            *total += cell.count;
+        }
+    }
+    totals
+}
+
+/// Flag the "peak" hours: those whose column total is at least 80% of the
+/// busiest hour (and non-zero). These are where new work is most likely to bump
+/// the concurrent cap.
+fn peak_hours(totals: &[usize; 24]) -> [bool; 24] {
+    let max = totals.iter().copied().max().unwrap_or(0);
+    let mut peaks = [false; 24];
+    if max == 0 {
+        return peaks;
+    }
+    let threshold = (max * 8).div_ceil(10);
+    for (peak, &total) in peaks.iter_mut().zip(totals.iter()) {
+        *peak = total >= threshold && total > 0;
+    }
+    peaks
 }
 
 /// Human-readable label for a source: `owner/repo` when GitHub metadata is
@@ -396,12 +556,29 @@ struct IndexParams {
 
 /// A pre-rendered table row, decoupled from Maud so it stays unit-testable.
 struct Row {
+    /// Bare session id (no `sessions/` prefix), used for the delete route.
+    id: String,
     repo: String,
     title: String,
     state: SessionState,
     create_time: Option<String>,
     update_time: Option<String>,
     url: Option<String>,
+}
+
+/// Bare session id (no `sessions/` prefix) suitable for the delete route path
+/// segment. Prefers the explicit `id` field, falling back to the resource name.
+fn session_ident(session: &Session) -> String {
+    if let Some(id) = &session.id {
+        if !id.trim().is_empty() {
+            return id.clone();
+        }
+    }
+    session
+        .name
+        .strip_prefix("sessions/")
+        .unwrap_or(&session.name)
+        .to_string()
 }
 
 /// Build, filter, and sort the table rows from the sessions.
@@ -413,6 +590,7 @@ fn build_rows(
     let mut rows: Vec<Row> = sessions
         .iter()
         .map(|session| Row {
+            id: session_ident(session),
             repo: repo_label(session, labels),
             title: session_title(session),
             state: session_state(session),
@@ -484,6 +662,34 @@ async fn api_summary() -> Result<Json<Summary>, (StatusCode, Json<serde_json::Va
     Ok(Json(Summary::from_sessions(&sessions)))
 }
 
+/// Delete a single session by bare id (for example `s-42`). The dashboard's
+/// per-row ✕ control POSTs here; on success the client reloads so all headline
+/// numbers recompute from fresh data.
+///
+/// Returns `200 OK` on success, `400 Bad Request` for an invalid id, and
+/// `502 Bad Gateway` when the Jules API rejects or cannot service the deletion.
+/// The API `Result` is always handled — the handler never panics on failure.
+#[post("/sessions/{id}/delete")]
+async fn delete_session_route(Path(id): Path<String>) -> (StatusCode, String) {
+    let Some(context) = CONTEXT.get() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "dashboard context is not initialized".to_string(),
+        );
+    };
+
+    match context.client.delete_session(&id).await {
+        Ok(()) => (StatusCode::OK, format!("deleted session {id}")),
+        Err(error) => {
+            let status = match &error {
+                JulesError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, format!("failed to delete session {id}: {error}"))
+        }
+    }
+}
+
 // ── Rendering ────────────────────────────────────────────────────
 
 /// Shared page chrome: dark theme, inline CSS, and a 10s auto-refresh meta tag.
@@ -533,10 +739,23 @@ fn render_dashboard(
 ) -> Markup {
     let running = count_running(sessions);
     let by_state = count_by_state(sessions);
+    let by_active = active_composition(sessions);
     let by_hour = count_by_hour(sessions);
     let rows = build_rows(sessions, labels, params);
     let max_hour = by_hour.iter().map(|(_, c)| *c).max().unwrap_or(0);
     let max_state = by_state.iter().map(|(_, c)| *c).max().unwrap_or(0);
+
+    // Inferred-schedule heatmap data (UTC, from historical create_time).
+    let heat_rows = heatmap_rows(sessions, labels);
+    let heat_totals = hour_totals(&heat_rows);
+    let heat_peaks = peak_hours(&heat_totals);
+    let heat_max_cell = heat_rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .map(|cell| cell.count)
+        .max()
+        .unwrap_or(0);
+    let heat_hidden = heat_rows.len().saturating_sub(HEATMAP_MAX_ROWS);
 
     page_shell(
         "Jules Dashboard",
@@ -549,7 +768,33 @@ fn render_dashboard(
             section class="cards" {
                 div class="card headline" {
                     div class="headline-num" { (running) }
-                    div class="headline-label" { "sessions running now" }
+                    div class="headline-label" { "active sessions (non-terminal)" }
+                    @if by_active.is_empty() {
+                        div class="headline-sub muted" { "nothing running right now" }
+                    } @else {
+                        div class="composition" {
+                            @for (state, count) in &by_active {
+                                span class="chip"
+                                    style={ "border-color:" (state_color(*state)) "66;color:" (state_color(*state)) ";" } {
+                                    span class="chip-dot" style={ "background:" (state_color(*state)) ";" } {}
+                                    (count) " " (state_display(*state))
+                                }
+                            }
+                        }
+                    }
+                    div class="capacity" {
+                        div class="capacity-track" {
+                            div class="capacity-fill" style={ "width:" (cap_pct(running)) "%;" } {}
+                        }
+                        div class="capacity-label" {
+                            (running) " / " (CONCURRENT_CAP)
+                            span class="muted" { " · Ultra plan limit: " (CONCURRENT_CAP) " concurrent tasks" }
+                        }
+                        div class="capacity-note muted" {
+                            "Jules' docs don't specify whether queued sessions count toward the "
+                            (CONCURRENT_CAP) "-concurrent cap, so treat this as an upper bound."
+                        }
+                    }
                 }
                 div class="card" {
                     div class="stat-num" { (sessions.len()) }
@@ -595,6 +840,61 @@ fn render_dashboard(
             }
 
             section class="panel" {
+                h2 { "Inferred schedule — load by hour (UTC)" }
+                p class="disclaimer" {
+                    "The Jules API does not expose scheduled tasks — this is inferred from "
+                    "when sessions were historically created (UTC), not the actual schedule."
+                }
+                @if heat_rows.is_empty() {
+                    p class="muted" {
+                        "Not enough history to infer a schedule yet — no sessions have a "
+                        "parseable creation time."
+                    }
+                } @else {
+                    div class="heatmap-scroll" {
+                        div class="heatmap" {
+                            div class="heat-row heat-head" {
+                                div class="heat-repo" { "repo \\ hour" }
+                                @for hour in 0u8..24 {
+                                    div class="heat-hh" { (format!("{hour:02}")) }
+                                }
+                            }
+                            @for row in heat_rows.iter().take(HEATMAP_MAX_ROWS) {
+                                div class="heat-row" {
+                                    div class="heat-repo mono" title=(row.repo) { (truncate(&row.repo, 22)) }
+                                    @for (hour, cell) in row.cells.iter().enumerate() {
+                                        div.heat-cell.recurring[cell.is_recurring()]
+                                            style=(heat_style(cell.count, heat_max_cell))
+                                            title=(cell_title(&row.repo, hour, *cell)) {
+                                            @if cell.count > 0 { (cell.count) }
+                                        }
+                                    }
+                                }
+                            }
+                            div class="heat-row heat-foot" {
+                                div class="heat-repo" { "all repos" }
+                                @for (total, peak) in heat_totals.iter().zip(heat_peaks.iter()) {
+                                    div.heat-tot.peak[*peak] { (total) }
+                                }
+                            }
+                        }
+                    }
+                    @if heat_hidden > 0 {
+                        p class="muted" {
+                            "Showing the top " (HEATMAP_MAX_ROWS) " repos by activity · "
+                            (heat_hidden) " more hidden."
+                        }
+                    }
+                    p class="caption muted" {
+                        "Ringed cells recurred on ≥ " (RECURRENCE_MIN_DAYS)
+                        " distinct dates — a likely recurring pattern. Highlighted footer hours "
+                        "are peak load, where new sessions are most likely to bump the "
+                        (CONCURRENT_CAP) "-concurrent cap."
+                    }
+                }
+            }
+
+            section class="panel" {
                 h2 { "Sessions" }
                 @if let Some(state) = &params.state {
                     p class="muted" { "filtered by state = " (state) }
@@ -610,6 +910,7 @@ fn render_dashboard(
                             th { "State" }
                             th { "Created" }
                             th { "Updated" }
+                            th class="kill-col" aria-label="Delete" { "" }
                         }
                     }
                     tbody {
@@ -631,6 +932,13 @@ fn render_dashboard(
                                 }
                                 td class="mono muted" { (format_time(row.create_time.as_deref())) }
                                 td class="mono muted" { (format_time(row.update_time.as_deref())) }
+                                td class="kill-cell" {
+                                    button type="button" class="kill"
+                                        data-id=(row.id)
+                                        data-title=(truncate(&row.title, 60))
+                                        title="Delete session"
+                                        aria-label="Delete session" { "✕" }
+                                }
                             }
                         }
                     }
@@ -639,6 +947,8 @@ fn render_dashboard(
                     p class="muted" { "No sessions match the current filters." }
                 }
             }
+
+            script { (PreEscaped(DELETE_SCRIPT)) }
         },
     )
 }
@@ -660,6 +970,29 @@ fn col_px(count: usize, max: usize) -> usize {
     }
     let px = count * 150 / max;
     px.max(6)
+}
+
+/// Inline background style for a heatmap cell, scaling the fill opacity by
+/// intensity relative to the busiest cell. Zero-count cells stay dark.
+fn heat_style(count: usize, max: usize) -> String {
+    if count == 0 || max == 0 {
+        return "background:#0b1120;".to_string();
+    }
+    // Integer alpha ramp 22%..100% (no float casts, pedantic-clippy friendly).
+    let alpha = 22 + (count * 78 / max);
+    format!("background:rgb(56 189 248 / {alpha}%);")
+}
+
+/// Tooltip text for a heatmap cell.
+fn cell_title(repo: &str, hour: usize, cell: HeatCell) -> String {
+    if cell.count == 0 {
+        format!("{repo} · {hour:02}:00 UTC · no sessions")
+    } else {
+        format!(
+            "{repo} · {hour:02}:00 UTC · {} sessions across {} days",
+            cell.count, cell.days
+        )
+    }
 }
 
 /// Shorten a `YYYY-MM-DD HH:00` key to a compact `HH:00` axis label.
@@ -696,6 +1029,110 @@ body {
 }
 .headline-num { font-size: 64px; font-weight: 700; line-height: 1; color: #22c55e; }
 .headline-label { margin-top: 8px; color: #86efac; font-size: 14px; letter-spacing: 0.4px; }
+.headline-sub { margin-top: 10px; font-size: 13px; }
+.composition { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid transparent;
+    background: #0b1120;
+    font-variant-numeric: tabular-nums;
+}
+.chip-dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
+.capacity { margin-top: 16px; }
+.capacity-track {
+    background: #0b1120;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    height: 12px;
+    overflow: hidden;
+}
+.capacity-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #22c55e, #f59e0b);
+    border-radius: 6px;
+    min-width: 2px;
+    transition: width 0.2s;
+}
+.capacity-label { margin-top: 8px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.capacity-label .muted { font-weight: 400; }
+.capacity-note { margin-top: 6px; font-size: 11px; line-height: 1.4; }
+.disclaimer {
+    margin: -6px 0 16px;
+    font-size: 12px;
+    color: #fbbf24;
+    background: #2a2410;
+    border: 1px solid #4d3c12;
+    border-radius: 8px;
+    padding: 8px 12px;
+    line-height: 1.4;
+}
+.caption { margin-top: 12px; font-size: 12px; line-height: 1.4; }
+.heatmap-scroll { overflow-x: auto; padding-bottom: 4px; }
+.heatmap { display: flex; flex-direction: column; gap: 3px; min-width: 760px; }
+.heat-row {
+    display: grid;
+    grid-template-columns: 150px repeat(24, 1fr);
+    gap: 3px;
+    align-items: stretch;
+}
+.heat-repo {
+    display: flex;
+    align-items: center;
+    font-size: 12px;
+    color: #cbd5e1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-right: 6px;
+}
+.heat-head .heat-repo, .heat-foot .heat-repo { color: #94a3b8; font-weight: 600; }
+.heat-hh {
+    text-align: center;
+    font-size: 10px;
+    color: #64748b;
+    font-variant-numeric: tabular-nums;
+}
+.heat-cell {
+    position: relative;
+    height: 26px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #0b1120;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    border: 1px solid #16203a;
+}
+.heat-cell.recurring {
+    box-shadow: 0 0 0 2px #f59e0b inset;
+    border-color: #f59e0b;
+}
+.heat-tot {
+    height: 22px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #94a3b8;
+    font-variant-numeric: tabular-nums;
+    background: #0b1120;
+    border: 1px solid #16203a;
+}
+.heat-tot.peak {
+    color: #0b1120;
+    background: #f59e0b;
+    font-weight: 700;
+    border-color: #f59e0b;
+}
 .stat-num { font-size: 40px; font-weight: 700; line-height: 1; }
 .stat-label { margin-top: 8px; color: #94a3b8; font-size: 13px; }
 .panel {
@@ -755,7 +1192,74 @@ a:hover { text-decoration: underline; }
     padding: 24px;
 }
 .error-card h2 { margin-top: 0; color: #fca5a5; }
+.kill-col { width: 34px; }
+.kill-cell { text-align: center; width: 34px; }
+.kill {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #475569;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.kill:hover { color: #ef4444; background: #ef444422; border-color: #ef444455; }
+.kill.armed { color: #fff; background: #ef4444; border-color: #ef4444; font-weight: 700; }
+.kill:disabled { opacity: 0.55; cursor: default; }
 ";
+
+/// Inline script powering the per-row ✕ delete control. First click *arms* the
+/// button (a two-click confirm, no modal); a second click within a few seconds
+/// POSTs to `/sessions/{id}/delete`. On success the page reloads so every
+/// headline/heatmap/count recomputes from fresh data; on failure it surfaces
+/// the server message and leaves the page untouched.
+const DELETE_SCRIPT: &str = r#"
+(function () {
+    function disarm(btn) {
+        btn.dataset.armed = '0';
+        btn.classList.remove('armed');
+        btn.textContent = '✕';
+        btn.title = 'Delete session';
+        if (btn._t) { clearTimeout(btn._t); btn._t = null; }
+    }
+    document.addEventListener('click', function (e) {
+        var btn = e.target.closest('.kill');
+        if (!btn) { return; }
+        e.preventDefault();
+        if (btn.disabled) { return; }
+        if (btn.dataset.armed !== '1') {
+            document.querySelectorAll('.kill[data-armed="1"]').forEach(disarm);
+            btn.dataset.armed = '1';
+            btn.classList.add('armed');
+            btn.textContent = '✕?';
+            btn.title = 'Click again to confirm delete of ' + (btn.dataset.title || btn.dataset.id);
+            btn._t = setTimeout(function () { disarm(btn); }, 4000);
+            return;
+        }
+        if (btn._t) { clearTimeout(btn._t); btn._t = null; }
+        btn.disabled = true;
+        btn.textContent = '…';
+        var id = btn.dataset.id;
+        fetch('/sessions/' + encodeURIComponent(id) + '/delete', { method: 'POST' })
+            .then(function (r) {
+                if (r.ok) { location.reload(); return; }
+                return r.text().then(function (t) {
+                    window.alert('Delete failed: ' + (t || ('HTTP ' + r.status)));
+                    btn.disabled = false;
+                    disarm(btn);
+                });
+            })
+            .catch(function (err) {
+                window.alert('Delete failed: ' + err);
+                btn.disabled = false;
+                disarm(btn);
+            });
+    });
+})();
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -888,9 +1392,250 @@ mod tests {
         assert_eq!(repo_label(&s3, &labels), "(unknown)");
     }
 
+    /// Build a session tagged with a GitHub repo and a creation timestamp.
+    fn session_repo(repo: &str, create_time: &str) -> Session {
+        let mut s = session(Some(SessionState::InProgress), Some(create_time));
+        let (owner, name) = repo.split_once('/').unwrap();
+        s.source = Some(Source {
+            name: format!("sources/{repo}"),
+            id: None,
+            display_name: None,
+            description: None,
+            github_repo: Some(GithubRepoContext {
+                owner: owner.to_string(),
+                repo: name.to_string(),
+                is_private: None,
+                default_branch: None,
+                branches: Vec::new(),
+            }),
+        });
+        s
+    }
+
+    #[test]
+    fn count_in_state_and_active_composition() {
+        let sessions = vec![
+            session(Some(SessionState::InProgress), None),
+            session(Some(SessionState::InProgress), None),
+            session(Some(SessionState::Queued), None),
+            session(Some(SessionState::AwaitingUserFeedback), None),
+            session(Some(SessionState::Completed), None), // terminal, excluded
+            session(Some(SessionState::Failed), None),    // terminal, excluded
+        ];
+        assert_eq!(count_in_state(&sessions, SessionState::InProgress), 2);
+        assert_eq!(count_in_state(&sessions, SessionState::Queued), 1);
+        assert_eq!(count_in_state(&sessions, SessionState::Paused), 0);
+
+        // Composition is in ACTIVE_STATES order, non-zero only, and sums to the
+        // running total.
+        let comp = active_composition(&sessions);
+        assert_eq!(
+            comp,
+            vec![
+                (SessionState::InProgress, 2),
+                (SessionState::Queued, 1),
+                (SessionState::AwaitingUserFeedback, 1),
+            ]
+        );
+        let sum: usize = comp.iter().map(|(_, c)| *c).sum();
+        assert_eq!(sum, count_running(&sessions));
+    }
+
+    #[test]
+    fn cap_pct_clamps_to_100() {
+        assert_eq!(cap_pct(0), 0);
+        assert_eq!(cap_pct(30), 50);
+        assert_eq!(cap_pct(60), 100);
+        assert_eq!(cap_pct(120), 100); // over the cap still clamps
+    }
+
+    #[test]
+    fn date_and_hour_extracts_utc_parts() {
+        assert_eq!(
+            date_and_hour("2026-07-15T09:22:11Z"),
+            Some(("2026-07-15".to_string(), 9))
+        );
+        assert_eq!(
+            date_and_hour("2026-01-02T23:59:59Z"),
+            Some(("2026-01-02".to_string(), 23))
+        );
+        // Malformed / out-of-range inputs are rejected.
+        assert_eq!(date_and_hour("garbage"), None);
+        assert_eq!(date_and_hour("2026-07-15"), None);
+    }
+
+    #[test]
+    fn heatmap_rows_aggregate_and_detect_recurrence() {
+        let labels = BTreeMap::new();
+        let sessions = vec![
+            // acme/api at hour 9 across two distinct dates (3 sessions total).
+            session_repo("acme/api", "2026-07-10T09:00:00Z"),
+            session_repo("acme/api", "2026-07-11T09:30:00Z"),
+            session_repo("acme/api", "2026-07-11T09:45:00Z"),
+            // acme/web: one session, single date/hour.
+            session_repo("acme/web", "2026-07-10T14:00:00Z"),
+        ];
+        let rows = heatmap_rows(&sessions, &labels);
+        assert_eq!(rows.len(), 2);
+
+        // Busiest repo first.
+        assert_eq!(rows[0].repo, "acme/api");
+        assert_eq!(rows[0].total, 3);
+        let api_9 = rows[0].cells[9];
+        assert_eq!(api_9.count, 3);
+        assert_eq!(api_9.days, 2);
+        assert!(api_9.is_recurring()); // >= 2 distinct dates
+
+        assert_eq!(rows[1].repo, "acme/web");
+        let web_14 = rows[1].cells[14];
+        assert_eq!(web_14.count, 1);
+        assert_eq!(web_14.days, 1);
+        assert!(!web_14.is_recurring());
+
+        // Column totals + peak detection.
+        let totals = hour_totals(&rows);
+        assert_eq!(totals[9], 3);
+        assert_eq!(totals[14], 1);
+        assert_eq!(totals[0], 0);
+        let peaks = peak_hours(&totals);
+        assert!(peaks[9]); // busiest hour is a peak
+        assert!(!peaks[0]); // empty hour is never a peak
+    }
+
+    #[test]
+    fn heatmap_rows_skip_sessions_without_timestamps() {
+        let labels = BTreeMap::new();
+        let sessions = vec![
+            session_repo("acme/api", "not-a-timestamp"),
+            session(Some(SessionState::InProgress), None),
+        ];
+        assert!(heatmap_rows(&sessions, &labels).is_empty());
+    }
+
     #[test]
     fn truncate_adds_ellipsis_only_when_needed() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 5), "abcde…");
+    }
+
+    #[test]
+    fn session_ident_prefers_id_then_strips_prefix() {
+        // Missing id falls back to the resource name with the prefix stripped.
+        let mut s = session(None, None); // name = "sessions/x"
+        assert_eq!(session_ident(&s), "x");
+        // An explicit id wins.
+        s.id = Some("s-99".to_string());
+        assert_eq!(session_ident(&s), "s-99");
+    }
+
+    #[test]
+    fn session_row_renders_delete_control() {
+        let mut s = session(Some(SessionState::Queued), Some("2026-07-15T09:00:00Z"));
+        s.id = Some("s-42".to_string());
+        s.title = Some("zombie task".to_string());
+
+        let labels = BTreeMap::new();
+        let params = IndexParams::default();
+        let html = render_dashboard(std::slice::from_ref(&s), &labels, &params).into_string();
+
+        // The ✕ button carries the bare session id used to build the route.
+        assert!(html.contains(r#"class="kill""#));
+        assert!(html.contains(r#"data-id="s-42""#));
+        assert!(html.contains(r#"aria-label="Delete session""#));
+        // The inline script POSTs to /sessions/{id}/delete for that id.
+        assert!(html.contains("'/sessions/' + encodeURIComponent(id) + '/delete'"));
+    }
+
+    /// Renders the dashboard with a synthetic dataset and writes it to disk for
+    /// manual/visual inspection. Ignored by default; run with:
+    /// `cargo test --features web -- --ignored render_demo_dashboard --nocapture`
+    #[test]
+    #[ignore = "writes an HTML file for manual screenshotting"]
+    fn render_demo_dashboard() {
+        let mut sessions: Vec<Session> = Vec::new();
+        let mut push = |repo: &str, state: SessionState, ts: &str| {
+            let mut s = session_repo(repo, ts);
+            s.state = Some(state);
+            s.title = Some(format!("{repo}: automated task"));
+            sessions.push(s);
+        };
+
+        // Recurring pattern: acme/api at 09:00 UTC across five distinct dates.
+        for day in 10..=14 {
+            push(
+                "acme/api",
+                SessionState::InProgress,
+                &format!("2026-07-{day:02}T09:{:02}:00Z", day * 3 % 60),
+            );
+        }
+        // A spread of InProgress work concentrated in the afternoon peak.
+        let repos = ["acme/api", "acme/web", "acme/worker", "octo/cat", "globex/billing"];
+        for i in 0..26 {
+            let repo = repos[i % repos.len()];
+            let hour = 13 + (i % 4); // 13..16 afternoon peak
+            let day = 10 + (i % 5);
+            push(
+                repo,
+                SessionState::InProgress,
+                &format!("2026-07-{day:02}T{hour:02}:{:02}:00Z", i * 7 % 60),
+            );
+        }
+        // Queued backlog spread across morning/evening hours.
+        for i in 0..29 {
+            let repo = repos[(i + 2) % repos.len()];
+            let hour = (7 + i * 3) % 24;
+            let day = 11 + (i % 4);
+            push(
+                repo,
+                SessionState::Queued,
+                &format!("2026-07-{day:02}T{hour:02}:{:02}:00Z", i * 11 % 60),
+            );
+        }
+        // Awaiting feedback, planning, paused, and completed sessions.
+        for i in 0..4 {
+            push(
+                repos[i % repos.len()],
+                SessionState::AwaitingUserFeedback,
+                &format!("2026-07-13T10:{:02}:00Z", i * 9),
+            );
+        }
+        for i in 0..3 {
+            push(
+                repos[i % repos.len()],
+                SessionState::Planning,
+                &format!("2026-07-12T16:{:02}:00Z", i * 13),
+            );
+        }
+        for i in 0..2 {
+            push(
+                repos[i % repos.len()],
+                SessionState::Paused,
+                &format!("2026-07-14T20:{:02}:00Z", i * 17),
+            );
+        }
+        for i in 0..5 {
+            push(
+                repos[i % repos.len()],
+                SessionState::Completed,
+                &format!("2026-07-11T18:{:02}:00Z", i * 7),
+            );
+        }
+
+        // Populate the labels map so the "repositories" stat is accurate.
+        let mut labels = BTreeMap::new();
+        for repo in repos {
+            labels.insert(format!("sources/{repo}"), repo.to_string());
+        }
+
+        let params = IndexParams::default();
+        let html = render_dashboard(&sessions, &labels, &params).into_string();
+
+        let out = std::env::var("DEMO_OUT").unwrap_or_else(|_| "dashboard.html".to_string());
+        std::fs::write(&out, html).expect("write dashboard html");
+        eprintln!(
+            "wrote {out} · {} sessions · running={}",
+            sessions.len(),
+            count_running(&sessions)
+        );
     }
 }
