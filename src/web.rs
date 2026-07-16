@@ -888,7 +888,7 @@ async fn delete_session_route(Path(id): Path<String>) -> (StatusCode, String) {
 struct CloseAllForm {
     owner: String,
     repo: String,
-    /// The typed `owner/repo` confirmation string.
+    /// The typed confirmation string (the bare `repo` or `owner/repo`).
     confirm: String,
     /// Present (`"on"`/`"true"`/`"1"`) only when the "delete head branches" box
     /// was checked. An HTML checkbox omits its field entirely when unchecked, so
@@ -901,6 +901,21 @@ struct CloseAllForm {
     /// re-fetch. Optional: absence just skips the reconciliation.
     #[serde(default)]
     shown: Option<String>,
+}
+
+/// Whether the typed confirmation authorises closing PRs in `owner/repo`.
+///
+/// Forgiving on purpose: the confirm is an "are you sure" gesture, not the
+/// security boundary (the server independently re-classifies every PR). It
+/// trims surrounding whitespace and compares case-insensitively, accepting
+/// EITHER the bare `repo` (what users naturally type) OR the full `owner/repo`.
+/// Empty input never matches.
+fn confirm_matches(typed: &str, owner: &str, repo: &str) -> bool {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return false;
+    }
+    typed.eq_ignore_ascii_case(repo) || typed.eq_ignore_ascii_case(&format!("{owner}/{repo}"))
 }
 
 /// Parse a comma-separated list of PR numbers (as carried in the `shown` hidden
@@ -918,8 +933,9 @@ fn parse_pr_numbers(raw: Option<&str>) -> Vec<u64> {
 /// Guarded mass-close of every Jules-authored open PR in one repository.
 ///
 /// Safety invariants enforced here, server-side, regardless of page state:
-/// 1. `confirm` must equal `owner/repo` exactly (whitespace-trimmed), or the
-///    request is rejected and nothing is closed.
+/// 1. `confirm` must match this repo per [`confirm_matches`] (the bare `repo`
+///    or `owner/repo`, trimmed and case-insensitive), or the request is
+///    rejected and nothing is closed.
 /// 2. The open PR list is re-fetched and re-classified with [`JulesMatcher`];
 ///    only PRs the server independently flags as Jules are ever closed. A
 ///    client-supplied list of PR numbers is never trusted for *closing* — it is
@@ -954,7 +970,7 @@ async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
     let expected = format!("{owner}/{repo}");
     let matcher = JulesMatcher::from_env();
     let listed = parse_pr_numbers(form.shown.as_deref());
-    let confirm_ok = form.confirm.trim() == expected;
+    let confirm_ok = confirm_matches(&form.confirm, &owner, &repo);
 
     // 1. Confirm gate. On mismatch, render the results page (not a bare 4xx) so
     //    the user sees the exact reason nothing was closed.
@@ -1032,7 +1048,11 @@ async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
 struct CloseSummary {
     /// `owner/repo` this close targeted.
     target: String,
-    /// Whether the typed confirmation matched `target` (trimmed).
+    /// Bare `repo` name — the confirm token shown in the UI hint and named in
+    /// the mismatch banner.
+    repo: String,
+    /// Whether the typed confirmation matched (bare `repo` or `owner/repo`,
+    /// trimmed and case-insensitive).
     confirm_ok: bool,
     /// Whether head-branch deletion was requested (set by the handler).
     delete_branches: bool,
@@ -1060,8 +1080,8 @@ impl CloseSummary {
         }
         if !self.confirm_ok {
             return Some(format!(
-                "Confirmation text did not match `{}`, so nothing was closed.",
-                self.target
+                "Confirm text did not match — type `{}` to confirm closing PRs in {}. Nothing was closed.",
+                self.repo, self.target
             ));
         }
         if self.matched == 0 {
@@ -1092,7 +1112,7 @@ fn build_close_summary(
     outcomes: Vec<CloseOutcome>,
 ) -> CloseSummary {
     let target = format!("{owner}/{repo}");
-    let confirm_ok = typed_confirm.trim() == target;
+    let confirm_ok = confirm_matches(typed_confirm, owner, repo);
     let matched = reclassified.len();
     let closed = outcomes.iter().filter(|outcome| outcome.ok).count();
     let failed = outcomes.len() - closed;
@@ -1108,6 +1128,7 @@ fn build_close_summary(
 
     CloseSummary {
         target,
+        repo: repo.to_string(),
         confirm_ok,
         delete_branches: false,
         shown: listed.len(),
@@ -1936,16 +1957,22 @@ fn render_pr_group(group: &RepoPrGroup) -> Markup {
                         " in " strong { (target) } ". This cannot be undone from here."
                     }
                     label class="pr-confirm-label" {
-                        "Type " code { (target) } " to confirm:"
+                        "Type " code { (group.repo) } " to confirm:"
                         input class="pr-confirm-input" type="text" name="confirm"
                             autocomplete="off" spellcheck="false"
-                            data-expect=(target) placeholder=(target);
+                            data-repo=(group.repo) data-full=(target)
+                            data-count=(count) data-word=(pr_word(count))
+                            placeholder=(group.repo);
+                    }
+                    p class="pr-confirm-feedback" {
+                        "Type " code { (group.repo) } " to confirm closing "
+                        (count) " " (pr_word(count)) "."
                     }
                     label class="pr-branch-label" {
                         input type="checkbox" name="delete_branches" value="on";
                         " Also delete the head branches"
                     }
-                    button type="submit" class="pr-danger-btn" disabled {
+                    button type="submit" class="pr-danger-btn" {
                         "Close " (count) " " (pr_word(count))
                     }
                 }
@@ -2809,6 +2836,9 @@ a:hover { text-decoration: underline; }
     font-size: 13px;
 }
 .pr-confirm-input:focus { outline: none; border-color: #ef4444; }
+.pr-confirm-feedback { margin: -4px 0 0; font-size: 12px; line-height: 1.4; color: #94a3b8; }
+.pr-confirm-feedback code { color: #cbd5e1; }
+.pr-confirm-feedback.matched { color: #22c55e; font-weight: 600; }
 .pr-branch-label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; }
 .pr-danger-btn {
     align-self: flex-start;
@@ -2957,19 +2987,49 @@ const DELETE_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Inline script for the type-to-confirm mass-close form. The destructive
-/// submit button stays disabled until the text input's value exactly matches
-/// the panel's `owner/repo` (carried in `data-expect`). Server-side validation
-/// re-checks this, so the script is a UX guard, not the safety boundary.
+/// Inline script for the type-to-confirm forms.
+///
+/// Uses a single document-level `input` listener (event delegation) so it works
+/// for EVERY rendered card — including cards added by a tab re-render — and each
+/// input only ever touches controls inside its own `<form>` (via `input.form` /
+/// `closest('form')`). There are no per-card element ids to collide.
+///
+/// Two behaviours, dispatched by what the card contains:
+///
+/// * PR close-all cards carry a `.pr-confirm-feedback` line and `data-repo` /
+///   `data-full` on the input. The submit button is NOT gated — the server
+///   validates the confirm and always renders a clear result — so this only
+///   updates live helper text, switching to a ✓ matched state when the typed
+///   value (trimmed, case-insensitive) equals the bare `repo` or `owner/repo`.
+/// * Tools destructive cards still carry `data-expect`; for those the legacy
+///   disabled-until-exact-match gate is preserved.
 const PR_CONFIRM_SCRIPT: &str = r"
 (function () {
     document.addEventListener('input', function (e) {
         var input = e.target.closest('.pr-confirm-input');
         if (!input) { return; }
-        var form = input.closest('form');
-        var btn = form ? form.querySelector('.pr-danger-btn') : null;
-        if (!btn) { return; }
-        btn.disabled = input.value.trim() !== input.dataset.expect;
+        var form = input.form || input.closest('form');
+        if (!form) { return; }
+        var typed = input.value.trim();
+
+        var feedback = form.querySelector('.pr-confirm-feedback');
+        if (feedback) {
+            var lo = typed.toLowerCase();
+            var repo = (input.dataset.repo || '').toLowerCase();
+            var full = (input.dataset.full || '').toLowerCase();
+            var matched = lo !== '' && (lo === repo || lo === full);
+            var count = input.dataset.count || '';
+            var word = input.dataset.word || 'PRs';
+            feedback.classList.toggle('matched', matched);
+            feedback.textContent = matched
+                ? '✓ Confirmed — ready to close ' + count + ' ' + word + '.'
+                : 'Type ' + (input.dataset.repo || '') + ' to confirm closing ' + count + ' ' + word + '.';
+        }
+
+        if (input.dataset.expect !== undefined) {
+            var btn = form.querySelector('.pr-danger-btn');
+            if (btn) { btn.disabled = typed !== input.dataset.expect; }
+        }
     });
 })();
 ";
@@ -3426,13 +3486,18 @@ mod tests {
         assert!(html.contains("open Jules"));
         assert!(html.contains("acme/api"));
         assert!(html.contains("Jules PRs"));
-        // The guarded close form: hidden fields, type-to-confirm input, disabled
-        // destructive button, and the branch-delete checkbox.
+        // The guarded close form: hidden fields, type-to-confirm input keyed to
+        // the bare repo, per-card live-feedback line, the branch-delete checkbox,
+        // and an ALWAYS-ENABLED destructive button (the server validates confirm).
         assert!(html.contains(r#"action="/prs/close-all""#));
         assert!(html.contains(r#"name="confirm""#));
-        assert!(html.contains(r#"data-expect="acme/api""#));
+        assert!(html.contains(r#"data-repo="api""#));
+        assert!(html.contains(r#"data-full="acme/api""#));
+        assert!(html.contains("pr-confirm-feedback"));
         assert!(html.contains(r#"name="delete_branches""#));
-        assert!(html.contains("<button type=\"submit\" class=\"pr-danger-btn\" disabled"));
+        // Button is no longer JS-gated: it must render without `disabled`.
+        assert!(html.contains(r#"<button type="submit" class="pr-danger-btn">"#));
+        assert!(!html.contains(r#"class="pr-danger-btn" disabled"#));
     }
 
     /// A matcher with fixed config, independent of the environment, for the
@@ -3472,6 +3537,22 @@ mod tests {
         assert_eq!(parse_pr_numbers(None), Vec::<u64>::new());
         assert_eq!(parse_pr_numbers(Some("")), Vec::<u64>::new());
         assert_eq!(parse_pr_numbers(Some("10, 11 ,,x,12")), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn confirm_matches_accepts_bare_repo_or_full_case_insensitively() {
+        // Accepts the bare repo name (what users naturally type).
+        assert!(confirm_matches("force-rs", "madmax983", "force-rs"));
+        // Accepts the full owner/repo.
+        assert!(confirm_matches("madmax983/force-rs", "madmax983", "force-rs"));
+        // Trims surrounding whitespace and ignores case.
+        assert!(confirm_matches("  Force-RS  ", "madmax983", "force-rs"));
+        assert!(confirm_matches(" MADMAX983/FORCE-RS ", "madmax983", "force-rs"));
+        // Rejects empty, unrelated, and near-miss (missing hyphen) input.
+        assert!(!confirm_matches("", "madmax983", "force-rs"));
+        assert!(!confirm_matches("   ", "madmax983", "force-rs"));
+        assert!(!confirm_matches("wrong", "madmax983", "force-rs"));
+        assert!(!confirm_matches("forcers", "madmax983", "force-rs"));
     }
 
     #[test]
