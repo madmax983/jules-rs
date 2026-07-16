@@ -41,11 +41,17 @@ mod reviewer;
 #[cfg(feature = "risk_heatmap")]
 mod risk_heatmap;
 
-#[cfg(feature = "web")]
+#[cfg(any(feature = "web", feature = "triage"))]
 pub mod github;
 
 #[cfg(feature = "web")]
 pub mod web;
+
+#[cfg(feature = "triage")]
+pub mod anthropic;
+
+#[cfg(feature = "triage")]
+pub mod triage;
 
 pub use client::{JulesClient, JulesClientBuilder};
 pub use client::{RetryPolicy, TimeoutPolicy};
@@ -88,3 +94,11 @@ pub use reviewer::{FindingSeverity, ReviewFinding, ReviewReport, SessionReviewer
 
 #[cfg(feature = "risk_heatmap")]
 pub use risk_heatmap::ProjectRiskHeatmap;
+
+#[cfg(feature = "triage")]
+pub use anthropic::AnthropicClient;
+
+#[cfg(feature = "triage")]
+pub use triage::{
+    Evaluator, HeuristicEvaluator, LlmEvaluator, PrContext, Recommendation, TriageMode, Verdict,
+};
