@@ -2097,6 +2097,13 @@ struct ToolSpec {
     destructive: bool,
 }
 
+impl ToolSpec {
+    /// The fixed argv as owned `String`s, ready to hand to [`execute_tool`].
+    fn argv_owned(&self) -> Vec<String> {
+        self.argv.iter().copied().map(String::from).collect()
+    }
+}
+
 /// Map a hardcoded [`ToolId`] to its fixed [`ToolSpec`]. Exhaustive match: every
 /// variant maps to a concrete, auditable argv, and no argv contains any
 /// client-supplied text. This is the security boundary for the Tools tab.
@@ -2182,6 +2189,21 @@ struct ToolResult {
     stderr: String,
 }
 
+impl ToolResult {
+    /// Build a result for a run that produced no output — a rejected request
+    /// (unknown tool, failed confirmation) or a process that never ran to
+    /// completion (spawn/wait error, timeout).
+    fn without_output(name: String, argv: Vec<String>, status: ToolStatus) -> Self {
+        ToolResult {
+            name,
+            argv,
+            status,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
 /// A one-line human/audit label for a [`ToolStatus`]. Used both on the results
 /// page and in the `[tools]` diagnostic line.
 fn status_label(status: &ToolStatus) -> String {
@@ -2222,13 +2244,11 @@ async fn execute_tool(name: &str, argv: Vec<String>) -> ToolResult {
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return ToolResult {
-                name: name.to_string(),
+            return ToolResult::without_output(
+                name.to_string(),
                 argv,
-                status: ToolStatus::SpawnFailed(error.to_string()),
-                stdout: String::new(),
-                stderr: String::new(),
-            };
+                ToolStatus::SpawnFailed(error.to_string()),
+            );
         }
     };
 
@@ -2248,21 +2268,17 @@ async fn execute_tool(name: &str, argv: Vec<String>) -> ToolResult {
             }
         }
         // I/O error while waiting on the child.
-        Ok(Err(error)) => ToolResult {
-            name: name.to_string(),
+        Ok(Err(error)) => ToolResult::without_output(
+            name.to_string(),
             argv,
-            status: ToolStatus::SpawnFailed(error.to_string()),
-            stdout: String::new(),
-            stderr: String::new(),
-        },
+            ToolStatus::SpawnFailed(error.to_string()),
+        ),
         // Timed out — dropping the `wait_with_output` future kills the child.
-        Err(_elapsed) => ToolResult {
-            name: name.to_string(),
+        Err(_elapsed) => ToolResult::without_output(
+            name.to_string(),
             argv,
-            status: ToolStatus::TimedOut(TOOL_TIMEOUT.as_secs()),
-            stdout: String::new(),
-            stderr: String::new(),
-        },
+            ToolStatus::TimedOut(TOOL_TIMEOUT.as_secs()),
+        ),
     }
 }
 
@@ -2297,18 +2313,16 @@ async fn run_tool(Form(form): Form<ToolRunForm>) -> (StatusCode, Markup) {
     // 1. Allowlist lookup. Unknown → error page, no execution.
     let Some(id) = tool_from_slug(form.tool.trim()) else {
         eprintln!("[tools] id={:?} unknown → nothing executed", form.tool);
-        let result = ToolResult {
-            name: form.tool.clone(),
-            argv: Vec::new(),
-            status: ToolStatus::UnknownTool(form.tool.clone()),
-            stdout: String::new(),
-            stderr: String::new(),
-        };
+        let result = ToolResult::without_output(
+            form.tool.clone(),
+            Vec::new(),
+            ToolStatus::UnknownTool(form.tool.clone()),
+        );
         return (StatusCode::BAD_REQUEST, render_tool_result(&result));
     };
 
     let spec = tool_spec(id);
-    let argv: Vec<String> = spec.argv.iter().copied().map(String::from).collect();
+    let argv = spec.argv_owned();
 
     // 2. Confirm gate for destructive tools.
     if spec.destructive {
@@ -2319,13 +2333,8 @@ async fn run_tool(Form(form): Form<ToolRunForm>) -> (StatusCode, Markup) {
                 spec.slug,
                 argv.join(" ")
             );
-            let result = ToolResult {
-                name: spec.name.to_string(),
-                argv,
-                status: ToolStatus::ConfirmFailed,
-                stdout: String::new(),
-                stderr: String::new(),
-            };
+            let result =
+                ToolResult::without_output(spec.name.to_string(), argv, ToolStatus::ConfirmFailed);
             return (StatusCode::BAD_REQUEST, render_tool_result(&result));
         }
     }
@@ -3916,14 +3925,10 @@ mod tests {
             std::fs::write(&out, tab_html).expect("write tools html");
 
             // Synthetic successful run (exit 0 with some stdout) for the results page.
+            let triage = tool_spec(ToolId::PrTriageReport);
             let sample = ToolResult {
-                name: tool_spec(ToolId::PrTriageReport).name.to_string(),
-                argv: tool_spec(ToolId::PrTriageReport)
-                    .argv
-                    .iter()
-                    .copied()
-                    .map(String::from)
-                    .collect(),
+                name: triage.name.to_string(),
+                argv: triage.argv_owned(),
                 status: ToolStatus::Exited(0),
                 stdout: "Triaged 3 Jules PR(s): 1 merge / 1 close / 1 needs_human  \
                          (dry-run — nothing was closed or merged)\n\
