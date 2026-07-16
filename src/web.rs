@@ -10,9 +10,8 @@
 //! tested without any network access.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use autumn_web::prelude::*;
 use serde::Serialize;
@@ -24,12 +23,48 @@ use crate::{
     TimeoutPolicy,
 };
 
+/// Short-TTL for the in-memory dashboard cache. Slightly under the 10s
+/// meta-refresh so data stays fresh but rapid tab clicks (and the auto-refresh)
+/// are served from cache instead of re-hitting the Jules and GitHub APIs.
+const CACHE_TTL: Duration = Duration::from_secs(8);
+
+/// A value stamped with the [`Instant`] it was fetched, for TTL checks.
+struct TimedCache<T> {
+    fetched_at: Instant,
+    value: T,
+}
+
+/// Process-wide, short-lived cache shared behind a [`Mutex`]. Holds the Jules
+/// `list_sessions`/`list_sources` results (used by every session tab) and the
+/// per-repo GitHub PR listing (used by the PRs tab), each keyed by fetch time.
+#[derive(Default)]
+struct DashboardCache {
+    sessions: Option<TimedCache<Arc<Vec<Session>>>>,
+    sources: Option<TimedCache<Arc<Vec<Source>>>>,
+    prs: BTreeMap<(String, String), TimedCache<Arc<Vec<Pr>>>>,
+}
+
+/// Whether a cache entry fetched at `fetched_at` is still fresh at `now` under
+/// `ttl`. Pure and unit-tested so the TTL logic needs no live fetches.
+fn is_fresh(fetched_at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.duration_since(fetched_at) < ttl
+}
+
 /// Shared, process-wide request context. Built once at startup and read by the
 /// stateless route handlers registered through the `routes!` macro.
 struct WebContext {
     client: JulesClient,
     /// GitHub client for the PRs tab, present only when `GITHUB_TOKEN` is set.
     github: Option<Arc<GithubClient>>,
+    /// Short-TTL cache so switching tabs / the 10s auto-refresh reuse recent
+    /// data instead of re-hitting the upstream APIs on every request.
+    cache: Arc<Mutex<DashboardCache>>,
+}
+
+/// Lock the cache mutex, recovering the guard even if a previous holder panicked
+/// (a poisoned cache is never worse than a stale one).
+fn lock_cache(cache: &Mutex<DashboardCache>) -> std::sync::MutexGuard<'_, DashboardCache> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static CONTEXT: OnceLock<WebContext> = OnceLock::new();
@@ -75,7 +110,11 @@ pub async fn run() -> Result<(), String> {
     let client = build_client_from_env()?;
     let github = GithubClient::from_env().map(Arc::new);
     CONTEXT
-        .set(WebContext { client, github })
+        .set(WebContext {
+            client,
+            github,
+            cache: Arc::new(Mutex::new(DashboardCache::default())),
+        })
         .map_err(|_| "web context was already initialized".to_string())?;
 
     autumn_web::app()
@@ -132,6 +171,95 @@ async fn fetch_all_sources(client: &JulesClient) -> Result<Vec<Source>, JulesErr
         }
     }
     Ok(all)
+}
+
+/// Return every session, served from the short-TTL cache when a recent fetch is
+/// still fresh and re-fetching (then caching) otherwise. The mutex guard is
+/// always dropped before the `await`, so no lock is held across the network call.
+async fn cached_sessions(context: &WebContext) -> Result<Arc<Vec<Session>>, JulesError> {
+    let now = Instant::now();
+    {
+        let cache = lock_cache(&context.cache);
+        if let Some(entry) = &cache.sessions {
+            if is_fresh(entry.fetched_at, now, CACHE_TTL) {
+                return Ok(Arc::clone(&entry.value));
+            }
+        }
+    }
+    let fresh = Arc::new(fetch_all_sessions(&context.client).await?);
+    {
+        let mut cache = lock_cache(&context.cache);
+        cache.sessions = Some(TimedCache {
+            fetched_at: Instant::now(),
+            value: Arc::clone(&fresh),
+        });
+    }
+    Ok(fresh)
+}
+
+/// Return every source, served from the short-TTL cache when fresh. Mirrors
+/// [`cached_sessions`]; the lock is never held across the `await`.
+async fn cached_sources(context: &WebContext) -> Result<Arc<Vec<Source>>, JulesError> {
+    let now = Instant::now();
+    {
+        let cache = lock_cache(&context.cache);
+        if let Some(entry) = &cache.sources {
+            if is_fresh(entry.fetched_at, now, CACHE_TTL) {
+                return Ok(Arc::clone(&entry.value));
+            }
+        }
+    }
+    let fresh = Arc::new(fetch_all_sources(&context.client).await?);
+    {
+        let mut cache = lock_cache(&context.cache);
+        cache.sources = Some(TimedCache {
+            fetched_at: Instant::now(),
+            value: Arc::clone(&fresh),
+        });
+    }
+    Ok(fresh)
+}
+
+/// List one repo's open pulls, served from the short-TTL cache when fresh. Used
+/// by the PRs-tab render only; the destructive close path always re-fetches
+/// live (uncached) so its re-classification is authoritative. The lock is never
+/// held across the `await`.
+async fn cached_open_pulls(
+    github: Arc<GithubClient>,
+    cache: Arc<Mutex<DashboardCache>>,
+    owner: String,
+    repo: String,
+) -> Result<Arc<Vec<Pr>>, crate::github::GithubError> {
+    let key = (owner.clone(), repo.clone());
+    let now = Instant::now();
+    {
+        let guard = lock_cache(&cache);
+        if let Some(entry) = guard.prs.get(&key) {
+            if is_fresh(entry.fetched_at, now, CACHE_TTL) {
+                return Ok(Arc::clone(&entry.value));
+            }
+        }
+    }
+    let fresh = Arc::new(github.list_open_pulls(&owner, &repo).await?);
+    {
+        let mut guard = lock_cache(&cache);
+        guard.prs.insert(
+            key,
+            TimedCache {
+                fetched_at: Instant::now(),
+                value: Arc::clone(&fresh),
+            },
+        );
+    }
+    Ok(fresh)
+}
+
+/// Drop any cached PR listing for `owner/repo` so the next PRs-tab render
+/// re-fetches live. Called after a mass-close so the tab reflects the closes.
+fn invalidate_pr_cache(cache: &Mutex<DashboardCache>, owner: &str, repo: &str) {
+    lock_cache(cache)
+        .prs
+        .remove(&(owner.to_string(), repo.to_string()));
 }
 
 // ── Pure aggregation helpers ─────────────────────────────────────
@@ -661,11 +789,11 @@ async fn index(Query(params): Query<IndexParams>) -> Markup {
         return render_error("dashboard context is not initialized");
     };
 
-    let sessions = match fetch_all_sessions(&context.client).await {
+    let sessions = match cached_sessions(context).await {
         Ok(sessions) => sessions,
         Err(error) => return render_error(&format!("failed to load sessions: {error}")),
     };
-    let sources = match fetch_all_sources(&context.client).await {
+    let sources = match cached_sources(context).await {
         Ok(sources) => sources,
         Err(error) => return render_error(&format!("failed to load sources: {error}")),
     };
@@ -680,7 +808,14 @@ async fn index(Query(params): Query<IndexParams>) -> Markup {
         };
         let matcher = JulesMatcher::from_env();
         let repos = distinct_repos(&labels);
-        let groups = fetch_pr_groups(Arc::clone(github), &matcher, repos, current_unix()).await;
+        let groups = fetch_pr_groups(
+            Arc::clone(github),
+            Arc::clone(&context.cache),
+            &matcher,
+            repos,
+            current_unix(),
+        )
+        .await;
         return render_prs_dashboard(&groups, true);
     }
 
@@ -735,34 +870,68 @@ async fn delete_session_route(Path(id): Path<String>) -> (StatusCode, String) {
 }
 
 /// Form fields `POSTed` by the guarded "close all Jules PRs" control.
+///
+/// Every field beyond `owner`/`repo`/`confirm` is optional so a slightly
+/// different browser payload (an unchecked checkbox omits its field entirely,
+/// an older cached page omits `shown`) still deserializes instead of rejecting
+/// the whole form with a 4xx and closing nothing.
 #[derive(Debug, serde::Deserialize)]
 struct CloseAllForm {
     owner: String,
     repo: String,
     /// The typed `owner/repo` confirmation string.
     confirm: String,
-    /// Present (`"on"`) only when the "delete head branches" box was checked.
+    /// Present (`"on"`/`"true"`/`"1"`) only when the "delete head branches" box
+    /// was checked. An HTML checkbox omits its field entirely when unchecked, so
+    /// this MUST stay optional — a `bool` here would fail to deserialize and
+    /// reject the whole form.
+    #[serde(default)]
     delete_branches: Option<String>,
+    /// Comma-separated PR numbers the page listed for this repo, so the server
+    /// can report any that were shown but no longer classify as Jules on
+    /// re-fetch. Optional: absence just skips the reconciliation.
+    #[serde(default)]
+    shown: Option<String>,
+}
+
+/// Parse a comma-separated list of PR numbers (as carried in the `shown` hidden
+/// field), skipping blanks and unparseable entries.
+fn parse_pr_numbers(raw: Option<&str>) -> Vec<u64> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .filter_map(|part| part.trim().parse::<u64>().ok())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Guarded mass-close of every Jules-authored open PR in one repository.
 ///
 /// Safety invariants enforced here, server-side, regardless of page state:
-/// 1. `confirm` must equal `owner/repo` exactly, or the request is rejected.
+/// 1. `confirm` must equal `owner/repo` exactly (whitespace-trimmed), or the
+///    request is rejected and nothing is closed.
 /// 2. The open PR list is re-fetched and re-classified with [`JulesMatcher`];
 ///    only PRs the server independently flags as Jules are ever closed. A
-///    client-supplied list of PR numbers is never trusted.
+///    client-supplied list of PR numbers is never trusted for *closing* — it is
+///    used only to report PRs that were *shown* but no longer match.
 ///
-/// Returns an HTML results page (no auto-refresh) with per-PR outcomes.
+/// The handler never fails silently: it always renders a results page (no
+/// auto-refresh) that states exactly what matched, closed, failed, or no longer
+/// matches, with an explicit reason banner whenever zero PRs were closed. It
+/// also emits `eprintln!` diagnostics (token presence as a bool only — never the
+/// value — plus the confirm result and per-PR close status).
 #[post("/prs/close-all")]
 async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
     let Some(context) = CONTEXT.get() else {
+        eprintln!("[close-all] context not initialized");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             render_close_error("dashboard context is not initialized"),
         );
     };
     let Some(github) = context.github.as_ref() else {
+        eprintln!("[close-all] token_present=false — GITHUB_TOKEN not configured");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             render_close_error(
@@ -771,13 +940,24 @@ async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
         );
     };
 
-    let expected = format!("{}/{}", form.owner, form.repo);
-    if form.confirm.trim() != expected {
+    let owner = form.owner.trim().to_string();
+    let repo = form.repo.trim().to_string();
+    let expected = format!("{owner}/{repo}");
+    let matcher = JulesMatcher::from_env();
+    let listed = parse_pr_numbers(form.shown.as_deref());
+    let confirm_ok = form.confirm.trim() == expected;
+
+    // 1. Confirm gate. On mismatch, render the results page (not a bare 4xx) so
+    //    the user sees the exact reason nothing was closed.
+    if !confirm_ok {
+        eprintln!(
+            "[close-all] repo={expected} token_present=true confirm_ok=false shown={} → nothing closed",
+            listed.len()
+        );
+        let summary = build_close_summary(&form.confirm, &owner, &repo, &listed, &[], Vec::new());
         return (
             StatusCode::BAD_REQUEST,
-            render_close_error(&format!(
-                "Confirmation text did not match. Expected `{expected}`, so nothing was closed."
-            )),
+            render_close_result(&summary, &matcher),
         );
     }
 
@@ -786,31 +966,148 @@ async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
         .as_deref()
         .is_some_and(|value| matches!(value, "on" | "true" | "1"));
 
-    // Re-fetch and re-classify server-side — never trust the page's list.
-    let matcher = JulesMatcher::from_env();
-    let targets: Vec<Pr> = match github.list_open_pulls(&form.owner, &form.repo).await {
+    // 2. Re-fetch and re-classify server-side — never trust the page's list for
+    //    what to close. Always fetch live (uncached) so this is authoritative.
+    let targets: Vec<Pr> = match github.list_open_pulls(&owner, &repo).await {
         Ok(prs) => prs.into_iter().filter(|pr| matcher.is_jules(pr)).collect(),
         Err(error) => {
+            eprintln!("[close-all] repo={expected} list_open_pulls failed: {error}");
             return (
                 StatusCode::BAD_GATEWAY,
-                render_close_error(&format!("failed to list open pulls for {expected}: {error}")),
+                render_close_error(&format!(
+                    "Failed to list open pulls for {expected}, so nothing was closed: {error}"
+                )),
             );
         }
     };
+    let reclassified: Vec<u64> = targets.iter().map(|pr| pr.number).collect();
 
-    let outcomes = close_prs(
-        Arc::clone(github),
-        &form.owner,
-        &form.repo,
-        targets,
-        delete_branches,
-    )
-    .await;
+    eprintln!(
+        "[close-all] repo={expected} token_present=true confirm_ok=true delete_branches={delete_branches} shown={} matched={}",
+        listed.len(),
+        reclassified.len()
+    );
 
-    (
-        StatusCode::OK,
-        render_close_result(&expected, delete_branches, &outcomes),
-    )
+    let outcomes = close_prs(Arc::clone(github), &owner, &repo, targets, delete_branches).await;
+    for outcome in &outcomes {
+        eprintln!(
+            "[close-all] repo={expected} pr=#{} ok={} msg={}",
+            outcome.number, outcome.ok, outcome.message
+        );
+    }
+
+    let mut summary = build_close_summary(&form.confirm, &owner, &repo, &listed, &reclassified, outcomes);
+    summary.delete_branches = delete_branches;
+
+    eprintln!(
+        "[close-all] repo={expected} matched={} closed={} failed={} shown_but_unmatched={}",
+        summary.matched,
+        summary.closed,
+        summary.failed,
+        summary.unmatched.len()
+    );
+
+    // Reflect the closes on the PRs tab immediately.
+    if summary.closed > 0 {
+        invalidate_pr_cache(&context.cache, &owner, &repo);
+    }
+
+    (StatusCode::OK, render_close_result(&summary, &matcher))
+}
+
+/// Pure results model for a mass-close, decoupled from both rendering and the
+/// network so the summary logic is unit-testable. Built by
+/// [`build_close_summary`] from the typed confirmation, the repo, the PR numbers
+/// the page *showed*, the numbers the server *re-classified* as Jules, and the
+/// per-PR close outcomes.
+struct CloseSummary {
+    /// `owner/repo` this close targeted.
+    target: String,
+    /// Whether the typed confirmation matched `target` (trimmed).
+    confirm_ok: bool,
+    /// Whether head-branch deletion was requested (set by the handler).
+    delete_branches: bool,
+    /// How many PRs the page showed for this repo.
+    shown: usize,
+    /// How many PRs the server independently re-classified as Jules.
+    matched: usize,
+    /// How many closed successfully.
+    closed: usize,
+    /// How many close attempts failed.
+    failed: usize,
+    /// PR numbers shown on the page that no longer classify as Jules on re-fetch
+    /// (or are no longer open) and were therefore NOT closed.
+    unmatched: Vec<u64>,
+    /// Per-PR close outcomes, sorted by PR number.
+    outcomes: Vec<CloseOutcome>,
+}
+
+impl CloseSummary {
+    /// An explicit reason nothing was closed, or `None` when at least one PR
+    /// closed. Drives the results-page banner so the outcome is never ambiguous.
+    fn zero_reason(&self, matcher: &JulesMatcher) -> Option<String> {
+        if self.closed > 0 {
+            return None;
+        }
+        if !self.confirm_ok {
+            return Some(format!(
+                "Confirmation text did not match `{}`, so nothing was closed.",
+                self.target
+            ));
+        }
+        if self.matched == 0 {
+            return Some(format!(
+                "No open PRs matched the Jules filter on re-fetch (authors=[{}], marker='{}'), so nothing was closed.",
+                matcher.authors_display(),
+                matcher.marker_display()
+            ));
+        }
+        // matched > 0 but none closed → every attempt failed.
+        Some(format!(
+            "All {} matched {} failed to close — see the per-PR errors below.",
+            self.matched,
+            pr_word(self.matched)
+        ))
+    }
+}
+
+/// Build the pure [`CloseSummary`] from the raw inputs. `listed` is what the
+/// page showed; `reclassified` is what the server independently flagged as
+/// Jules; `outcomes` is the result of attempting to close the reclassified set.
+fn build_close_summary(
+    typed_confirm: &str,
+    owner: &str,
+    repo: &str,
+    listed: &[u64],
+    reclassified: &[u64],
+    outcomes: Vec<CloseOutcome>,
+) -> CloseSummary {
+    let target = format!("{owner}/{repo}");
+    let confirm_ok = typed_confirm.trim() == target;
+    let matched = reclassified.len();
+    let closed = outcomes.iter().filter(|outcome| outcome.ok).count();
+    let failed = outcomes.len() - closed;
+
+    let matched_set: BTreeSet<u64> = reclassified.iter().copied().collect();
+    let mut unmatched: Vec<u64> = listed
+        .iter()
+        .copied()
+        .filter(|number| !matched_set.contains(number))
+        .collect();
+    unmatched.sort_unstable();
+    unmatched.dedup();
+
+    CloseSummary {
+        target,
+        confirm_ok,
+        delete_branches: false,
+        shown: listed.len(),
+        matched,
+        closed,
+        failed,
+        unmatched,
+        outcomes,
+    }
 }
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -1283,6 +1580,9 @@ fn hour_short(key: &str) -> String {
 
 // ── PRs tab ──────────────────────────────────────────────────────
 
+/// Result of one repo's cached PR fetch: `(owner, repo, listing)`.
+type PrFetchResult = (String, String, Result<Arc<Vec<Pr>>, crate::github::GithubError>);
+
 /// Max concurrent per-repo PR-list requests during a PRs-tab render.
 const PR_FETCH_CONCURRENCY: usize = 6;
 
@@ -1407,6 +1707,7 @@ fn pr_view(pr: &Pr, now_unix: u64) -> PrView {
 /// omitted. Groups are sorted by descending Jules-PR count, then repo label.
 async fn fetch_pr_groups(
     github: Arc<GithubClient>,
+    cache: Arc<Mutex<DashboardCache>>,
     matcher: &JulesMatcher,
     repos: Vec<(String, String)>,
     now_unix: u64,
@@ -1414,14 +1715,15 @@ async fn fetch_pr_groups(
     let mut groups: Vec<RepoPrGroup> = Vec::new();
 
     for chunk in repos.chunks(PR_FETCH_CONCURRENCY) {
-        let mut set: JoinSet<(String, String, Result<Vec<Pr>, crate::github::GithubError>)> =
-            JoinSet::new();
+        let mut set: JoinSet<PrFetchResult> = JoinSet::new();
         for (owner, repo) in chunk {
             let github = Arc::clone(&github);
+            let cache = Arc::clone(&cache);
             let owner = owner.clone();
             let repo = repo.clone();
             set.spawn(async move {
-                let result = github.list_open_pulls(&owner, &repo).await;
+                let result =
+                    cached_open_pulls(Arc::clone(&github), cache, owner.clone(), repo.clone()).await;
                 (owner, repo, result)
             });
         }
@@ -1568,6 +1870,17 @@ fn render_prs(groups: &[RepoPrGroup], has_token: bool) -> Markup {
     }
 }
 
+/// Comma-separated PR numbers shown for a repo, carried in the form's `shown`
+/// hidden field so the server can reconcile shown-vs-matched after re-fetch.
+fn shown_numbers(group: &RepoPrGroup) -> String {
+    group
+        .prs
+        .iter()
+        .map(|pr| pr.number.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Render one repository's panel: a count badge, the PR list (capped), and the
 /// guarded type-to-confirm close-all form.
 fn render_pr_group(group: &RepoPrGroup) -> Markup {
@@ -1602,6 +1915,7 @@ fn render_pr_group(group: &RepoPrGroup) -> Markup {
                 form class="pr-form" method="post" action="/prs/close-all" {
                     input type="hidden" name="owner" value=(group.owner);
                     input type="hidden" name="repo" value=(group.repo);
+                    input type="hidden" name="shown" value=(shown_numbers(group));
                     p class="pr-warn" {
                         "This permanently closes " (count) " open pull " (pr_word(count))
                         " in " strong { (target) } ". This cannot be undone from here."
@@ -1625,10 +1939,19 @@ fn render_pr_group(group: &RepoPrGroup) -> Markup {
     }
 }
 
-/// Results page after a mass-close: headline counts and a per-PR line.
-fn render_close_result(target: &str, delete_branches: bool, outcomes: &[CloseOutcome]) -> Markup {
-    let closed = outcomes.iter().filter(|outcome| outcome.ok).count();
-    let failed = outcomes.len() - closed;
+/// Collapse whitespace and truncate a (possibly multi-line JSON) API error body
+/// to a compact single line for the per-PR results row.
+fn short_msg(message: &str) -> String {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&collapsed, 160)
+}
+
+/// Results page after a mass-close. Always renders a clear outcome: headline
+/// counts (shown / matched / closed / failed), an explicit reason banner when
+/// zero PRs were closed, any PRs that were shown but no longer match, and a
+/// per-PR line with trimmed API errors. No auto-refresh.
+fn render_close_result(summary: &CloseSummary, matcher: &JulesMatcher) -> Markup {
+    let zero_reason = summary.zero_reason(matcher);
 
     page_shell(
         "Jules Dashboard — close results",
@@ -1637,25 +1960,49 @@ fn render_close_result(target: &str, delete_branches: bool, outcomes: &[CloseOut
                 h1 { "Jules Dashboard" }
             }
             section class="panel" {
-                h2 { "Closed Jules PRs in " (target) }
+                h2 { "Close results for " (summary.target) }
                 p class="pr-result-summary" {
-                    span class="pr-ok" { (closed) " closed" }
+                    span class="pr-ok" { (summary.closed) " closed" }
                     " · "
-                    span class=(if failed > 0 { "pr-fail" } else { "muted" }) { (failed) " failed" }
+                    span class=(if summary.failed > 0 { "pr-fail" } else { "muted" }) {
+                        (summary.failed) " failed"
+                    }
+                    " · "
+                    span class="muted" {
+                        (summary.matched) " matched · " (summary.shown) " shown"
+                    }
                 }
-                @if delete_branches {
+                @if let Some(reason) = &zero_reason {
+                    div class="pr-reason" { (reason) }
+                }
+                @if !summary.unmatched.is_empty() {
+                    p class="pr-warn-note" {
+                        (summary.unmatched.len()) " " (pr_word(summary.unmatched.len()))
+                        " shown on the page no longer match the Jules filter on re-fetch and "
+                        "were NOT closed: "
+                        span class="mono" {
+                            @for (i, number) in summary.unmatched.iter().enumerate() {
+                                @if i > 0 { ", " }
+                                "#" (number)
+                            }
+                        }
+                    }
+                }
+                @if summary.delete_branches {
                     p class="muted" { "Head branch deletion was requested for each closed PR." }
                 }
-                @if outcomes.is_empty() {
-                    p class="muted" { "No Jules PRs were open in this repo at close time." }
+                @if summary.outcomes.is_empty() {
+                    p class="muted" {
+                        "No Jules PRs were closed. See the reason above for why."
+                    }
                 } @else {
                     div class="pr-list" {
-                        @for outcome in outcomes {
+                        @for outcome in &summary.outcomes {
                             div class="pr-row" {
                                 span class="pr-num mono muted" { "#" (outcome.number) }
                                 span class="pr-title" { (truncate(&outcome.title, 80)) }
                                 span class=(if outcome.ok { "pr-ok" } else { "pr-fail" }) {
-                                    (outcome.message)
+                                    (if outcome.ok { "✓ " } else { "✗ " }) (short_msg(&outcome.message))
                                 }
                             }
                         }
@@ -2052,6 +2399,26 @@ a:hover { text-decoration: underline; }
 .pr-result-summary { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .pr-ok { color: #22c55e; }
 .pr-fail { color: #ef4444; }
+.pr-reason {
+    margin: 14px 0;
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #fecaca;
+    background: #2a1216;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+}
+.pr-warn-note {
+    margin: 12px 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #fbbf24;
+    background: #2a2410;
+    border: 1px solid #4d3c12;
+    border-radius: 8px;
+}
 .pr-back { margin-top: 18px; }
 ";
 
@@ -2583,6 +2950,12 @@ mod tests {
         assert!(html.contains("<button type=\"submit\" class=\"pr-danger-btn\" disabled"));
     }
 
+    /// A matcher with fixed config, independent of the environment, for the
+    /// close-result render tests.
+    fn test_matcher() -> JulesMatcher {
+        JulesMatcher::from_env()
+    }
+
     #[test]
     fn close_result_page_summarizes_outcomes() {
         let outcomes = vec![
@@ -2599,11 +2972,162 @@ mod tests {
                 message: "github API error 403: nope".to_string(),
             },
         ];
-        let html = render_close_result("acme/api", false, &outcomes).into_string();
+        let summary = build_close_summary("acme/api", "acme", "api", &[10, 11], &[10, 11], outcomes);
+        let html = render_close_result(&summary, &test_matcher()).into_string();
         assert!(html.contains("1 closed"));
         assert!(html.contains("1 failed"));
         assert!(html.contains("/?tab=prs"));
         assert!(!html.contains(r#"http-equiv="refresh""#));
+        // One PR closed, so there is no zero-reason banner.
+        assert!(!html.contains("nothing was closed"));
+    }
+
+    #[test]
+    fn parse_pr_numbers_skips_blanks_and_junk() {
+        assert_eq!(parse_pr_numbers(None), Vec::<u64>::new());
+        assert_eq!(parse_pr_numbers(Some("")), Vec::<u64>::new());
+        assert_eq!(parse_pr_numbers(Some("10, 11 ,,x,12")), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn build_close_summary_confirm_mismatch_closes_nothing() {
+        // Typed confirmation does not match owner/repo.
+        let summary = build_close_summary("wrong", "acme", "api", &[10, 11], &[], Vec::new());
+        assert!(!summary.confirm_ok);
+        assert_eq!(summary.matched, 0);
+        assert_eq!(summary.closed, 0);
+        let reason = summary.zero_reason(&test_matcher()).expect("reason");
+        assert!(reason.contains("did not match"));
+        assert!(reason.contains("acme/api"));
+    }
+
+    #[test]
+    fn build_close_summary_zero_matched_reports_filter() {
+        // Confirm matches, but the re-fetch reclassified nothing as Jules; the
+        // two shown PRs are reported as no longer matching.
+        let summary = build_close_summary("acme/api", "acme", "api", &[10, 11], &[], Vec::new());
+        assert!(summary.confirm_ok);
+        assert_eq!(summary.matched, 0);
+        assert_eq!(summary.closed, 0);
+        assert_eq!(summary.unmatched, vec![10, 11]);
+        let reason = summary.zero_reason(&test_matcher()).expect("reason");
+        assert!(reason.contains("No open PRs matched the Jules filter"));
+        assert!(reason.contains("authors="));
+        assert!(reason.contains("marker="));
+    }
+
+    #[test]
+    fn build_close_summary_partial_failure_counts_and_reconciles() {
+        // Shown [10,11,12]; server reclassified [10,11] (12 no longer matches);
+        // 10 closed, 11 failed.
+        let outcomes = vec![
+            CloseOutcome {
+                number: 10,
+                title: "a".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 11,
+                title: "b".to_string(),
+                ok: false,
+                message: "github API error 403: forbidden".to_string(),
+            },
+        ];
+        let summary =
+            build_close_summary("acme/api", "acme", "api", &[10, 11, 12], &[10, 11], outcomes);
+        assert_eq!(summary.shown, 3);
+        assert_eq!(summary.matched, 2);
+        assert_eq!(summary.closed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.unmatched, vec![12]);
+        // At least one closed → no zero-reason banner.
+        assert!(summary.zero_reason(&test_matcher()).is_none());
+    }
+
+    #[test]
+    fn build_close_summary_all_success_has_no_reason() {
+        let outcomes = vec![
+            CloseOutcome {
+                number: 10,
+                title: "a".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 11,
+                title: "b".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+        ];
+        let summary = build_close_summary("acme/api", "acme", "api", &[10, 11], &[10, 11], outcomes);
+        assert_eq!(summary.closed, 2);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.unmatched.is_empty());
+        assert!(summary.zero_reason(&test_matcher()).is_none());
+    }
+
+    #[test]
+    fn build_close_summary_all_failed_reports_all_failed_reason() {
+        let outcomes = vec![CloseOutcome {
+            number: 10,
+            title: "a".to_string(),
+            ok: false,
+            message: "github API error 403: forbidden".to_string(),
+        }];
+        let summary = build_close_summary("acme/api", "acme", "api", &[10], &[10], outcomes);
+        assert_eq!(summary.closed, 0);
+        assert_eq!(summary.failed, 1);
+        let reason = summary.zero_reason(&test_matcher()).expect("reason");
+        assert!(reason.contains("failed to close"));
+    }
+
+    #[test]
+    fn close_result_renders_unmatched_note_and_reason() {
+        // Confirm ok, nothing matched, one shown PR reported as unmatched.
+        let summary = build_close_summary("acme/api", "acme", "api", &[10], &[], Vec::new());
+        let html = render_close_result(&summary, &test_matcher()).into_string();
+        assert!(html.contains("No open PRs matched the Jules filter"));
+        assert!(html.contains("were NOT closed"));
+        assert!(html.contains("#10"));
+        assert!(!html.contains(r#"http-equiv="refresh""#));
+    }
+
+    #[test]
+    fn is_fresh_respects_ttl() {
+        let ttl = Duration::from_secs(8);
+        let start = Instant::now();
+        // Just fetched → fresh.
+        assert!(is_fresh(start, start, ttl));
+        // Within TTL → fresh.
+        assert!(is_fresh(start, start + Duration::from_secs(7), ttl));
+        // At/after TTL → stale.
+        assert!(!is_fresh(start, start + Duration::from_secs(8), ttl));
+        assert!(!is_fresh(start, start + Duration::from_secs(20), ttl));
+    }
+
+    #[test]
+    fn shown_numbers_joins_pr_numbers() {
+        let group = RepoPrGroup {
+            owner: "acme".to_string(),
+            repo: "api".to_string(),
+            prs: vec![
+                PrView {
+                    number: 12,
+                    title: "a".to_string(),
+                    age: "1h".to_string(),
+                    html_url: String::new(),
+                },
+                PrView {
+                    number: 10,
+                    title: "b".to_string(),
+                    age: "2h".to_string(),
+                    html_url: String::new(),
+                },
+            ],
+        };
+        assert_eq!(shown_numbers(&group), "12,10");
     }
 
     /// Sample PR groups for the demo screenshot and the render tests.
@@ -2639,6 +3163,65 @@ mod tests {
                 prs: vec![view(77, "jules: document the deploy flow", "5d")],
             },
         ]
+    }
+
+    /// Renders the close-all RESULTS page from synthetic data and writes it to
+    /// disk for manual/visual inspection of the visible-error-reporting fix.
+    /// Ignored by default; run with:
+    /// `cargo test --features web -- --ignored render_demo_close_results --nocapture`
+    #[test]
+    #[ignore = "writes an HTML file for manual screenshotting"]
+    fn render_demo_close_results() {
+        // 5 matched server-side, 4 closed OK, 1 failed with an HTTP-403 reason.
+        let outcomes = vec![
+            CloseOutcome {
+                number: 4288,
+                title: "nova/refactor the session cache layer".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 4302,
+                title: "feature/rename config keys for clarity".to_string(),
+                ok: true,
+                message: "closed · branch delete failed: github API error 422: reference does not exist".to_string(),
+            },
+            CloseOutcome {
+                number: 4319,
+                title: "jules: add retry backoff to the poller".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 4321,
+                title: "nova: bump serde and tidy imports".to_string(),
+                ok: true,
+                message: "closed".to_string(),
+            },
+            CloseOutcome {
+                number: 4330,
+                title: "jules: regenerate the OpenAPI client".to_string(),
+                ok: false,
+                message: "github API error 403: {\"message\":\"Resource not accessible by personal access token\",\"documentation_url\":\"https://docs.github.com/rest\"}".to_string(),
+            },
+        ];
+        // Shown on the page: the 5 matched plus 2 that no longer classify.
+        let shown = [4288, 4302, 4319, 4321, 4330, 4111, 3999];
+        let matched = [4288, 4302, 4319, 4321, 4330];
+        let mut summary =
+            build_close_summary("acme/api", "acme", "api", &shown, &matched, outcomes);
+        summary.delete_branches = true;
+
+        let html = render_close_result(&summary, &JulesMatcher::from_env()).into_string();
+        let out = std::env::var("DEMO_OUT").unwrap_or_else(|_| "close-results.html".to_string());
+        std::fs::write(&out, html).expect("write close-results html");
+        eprintln!(
+            "wrote {out} · matched={} closed={} failed={} shown_but_unmatched={}",
+            summary.matched,
+            summary.closed,
+            summary.failed,
+            summary.unmatched.len()
+        );
     }
 
     /// Renders the dashboard with a synthetic dataset and writes it to disk for
