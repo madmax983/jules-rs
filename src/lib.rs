@@ -42,6 +42,9 @@ mod reviewer;
 mod risk_heatmap;
 
 #[cfg(feature = "web")]
+pub mod github;
+
+#[cfg(feature = "web")]
 pub mod web;
 
 pub use client::{JulesClient, JulesClientBuilder};
