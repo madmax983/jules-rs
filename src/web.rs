@@ -123,7 +123,8 @@ pub async fn run() -> Result<(), String> {
             api_summary,
             delete_session_route,
             close_all_prs,
-            run_tool
+            run_tool,
+            dashboard_js_asset
         ])
         .run()
         .await;
@@ -1163,6 +1164,13 @@ fn page_shell(title: &str, body: &Markup, auto_refresh: bool) -> Markup {
                 div class="wrap" {
                     (body)
                 }
+                div id="loading-overlay" class="loading-overlay" role="status" aria-live="polite" hidden {
+                    div class="loading-box" {
+                        div class="loading-spinner" {}
+                        p class="loading-text" id="loading-text" {}
+                    }
+                }
+                script src="/assets/dashboard.js" defer {}
             }
         }
     }
@@ -1244,8 +1252,9 @@ fn delete_button(row: &Row) -> Markup {
     }
 }
 
-/// Wrap a tab body in the shared dashboard chrome (top bar, tab nav, inline
-/// scripts). `auto_refresh` toggles the 10s meta-refresh — passed `false` for
+/// Wrap a tab body in the shared dashboard chrome (top bar, tab nav). The
+/// dashboard JavaScript is loaded by [`page_shell`] from the same-origin
+/// `/assets/dashboard.js` asset. `auto_refresh` toggles the 10s meta-refresh — passed `false` for
 /// the PRs tab so it never re-hits GitHub on a timer or interrupts typing.
 fn dashboard_page(active: &str, body: &Markup, auto_refresh: bool) -> Markup {
     let subtitle = if auto_refresh {
@@ -1262,8 +1271,6 @@ fn dashboard_page(active: &str, body: &Markup, auto_refresh: bool) -> Markup {
             }
             (render_tabs(active))
             (body)
-            script { (PreEscaped(DELETE_SCRIPT)) }
-            script { (PreEscaped(PR_CONFIRM_SCRIPT)) }
         },
         auto_refresh,
     )
@@ -1948,7 +1955,9 @@ fn render_pr_group(group: &RepoPrGroup) -> Markup {
                 summary class="pr-toggle" {
                     "Close all " (count) " Jules " (pr_word(count)) " in this repo"
                 }
-                form class="pr-form" method="post" action="/prs/close-all" {
+                form class="pr-form" method="post" action="/prs/close-all"
+                    data-loading="Closing Jules PRs — this can take a while for large backlogs…"
+                    data-loading-btn="Closing…" {
                     input type="hidden" name="owner" value=(group.owner);
                     input type="hidden" name="repo" value=(group.repo);
                     input type="hidden" name="shown" value=(shown_numbers(group));
@@ -2420,7 +2429,9 @@ fn render_tool_card(spec: &ToolSpec, reveal: bool) -> Markup {
             @if spec.destructive {
                 details class="pr-confirm" open[reveal] {
                     summary class="pr-toggle" { "Run " (spec.name) }
-                    form class="pr-form" method="post" action="/tools/run" {
+                    form class="pr-form" method="post" action="/tools/run"
+                        data-loading=(format!("Running {}…", spec.name))
+                        data-loading-btn="Running…" {
                         input type="hidden" name="tool" value=(spec.slug);
                         p class="pr-warn" {
                             "This runs a destructive maintenance command that may permanently "
@@ -2438,7 +2449,9 @@ fn render_tool_card(spec: &ToolSpec, reveal: bool) -> Markup {
                     }
                 }
             } @else {
-                form class="tool-form" method="post" action="/tools/run" {
+                form class="tool-form" method="post" action="/tools/run"
+                    data-loading=(format!("Running {}…", spec.name))
+                    data-loading-btn="Running…" {
                     input type="hidden" name="tool" value=(spec.slug);
                     button type="submit" class="tool-run-btn" { "Run " (spec.name) }
                 }
@@ -2935,9 +2948,44 @@ a:hover { text-decoration: underline; }
     max-height: 480px;
     overflow-y: auto;
 }
+.loading-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(2, 6, 23, 0.82);
+    backdrop-filter: blur(2px);
+}
+.loading-overlay[hidden] { display: none; }
+.loading-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
+    padding: 28px 34px;
+    border: 1px solid #1e293b;
+    border-radius: 14px;
+    background: #0f172a;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+    max-width: 420px;
+    text-align: center;
+}
+.loading-spinner {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 4px solid #1e293b;
+    border-top-color: #38bdf8;
+    animation: loading-spin 0.8s linear infinite;
+}
+.loading-text { margin: 0; font-size: 14px; line-height: 1.5; color: #e2e8f0; }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
 ";
 
-/// Inline script powering the per-row ✕ delete control. First click *arms* the
+/// Dashboard script powering the per-row ✕ delete control (served via
+/// [`dashboard_js_asset`], not inline). First click *arms* the
 /// button (a two-click confirm, no modal); a second click within a few seconds
 /// POSTs to `/sessions/{id}/delete`. On success the page reloads so every
 /// headline/heatmap/count recomputes from fresh data; on failure it surfaces
@@ -2987,7 +3035,8 @@ const DELETE_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Inline script for the type-to-confirm forms.
+/// Dashboard script for the type-to-confirm forms (served via
+/// [`dashboard_js_asset`], not inline).
 ///
 /// Uses a single document-level `input` listener (event delegation) so it works
 /// for EVERY rendered card — including cards added by a tab re-render — and each
@@ -3033,6 +3082,65 @@ const PR_CONFIRM_SCRIPT: &str = r"
     });
 })();
 ";
+
+/// Submit-loading UX for the slow, API-heavy actions (PR close-all, Tools run).
+///
+/// A single document-level `submit` listener (event delegation, so it survives
+/// the tab re-renders / 10s refresh) shows a full-page overlay with a spinner
+/// and disables the submit button the instant a `<form data-loading>` is
+/// submitted. Disabling the button inside the `submit` handler does NOT cancel
+/// the navigation — the browser has already gathered the form data — so the
+/// request still fires and the results page replaces the overlay on arrival.
+///
+/// The overlay text comes from the form's `data-loading` attribute; an optional
+/// `data-loading-btn` swaps the button label (e.g. "Closing…").
+const LOADING_SCRIPT: &str = r#"
+(function () {
+    document.addEventListener('submit', function (e) {
+        var form = e.target.closest('form[data-loading]');
+        if (!form) { return; }
+        var btn = form.querySelector('button[type="submit"]');
+        if (btn) {
+            if (btn.disabled) { return; }
+            var label = form.getAttribute('data-loading-btn');
+            if (label) { btn.textContent = label; }
+            btn.disabled = true;
+        }
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {
+            var text = document.getElementById('loading-text');
+            if (text) { text.textContent = form.getAttribute('data-loading') || 'Working…'; }
+            overlay.hidden = false;
+        }
+    });
+})();
+"#;
+
+/// The full dashboard JavaScript bundle, served as a same-origin static asset so
+/// it satisfies the framework's strict `script-src 'self'` CSP without any
+/// inline `<script>` (which that CSP blocks). Concatenates every behaviour: the
+/// per-row delete control, the type-to-confirm forms, and the submit-loading
+/// overlay. Assembled once on first use.
+fn dashboard_js() -> String {
+    format!("{DELETE_SCRIPT}\n{PR_CONFIRM_SCRIPT}\n{LOADING_SCRIPT}")
+}
+
+/// Serve the concatenated dashboard JavaScript at a stable same-origin URL.
+///
+/// Referenced by [`page_shell`] as `<script src="/assets/dashboard.js">`. Because
+/// it is same-origin and non-inline, it loads under the default `script-src
+/// 'self'` CSP that blocks inline scripts. The body is immutable per build, so a
+/// long cache lifetime is safe.
+#[get("/assets/dashboard.js")]
+async fn dashboard_js_asset() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/javascript; charset=utf-8"),
+            ("cache-control", "public, max-age=3600"),
+        ],
+        dashboard_js(),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -3367,8 +3475,12 @@ mod tests {
         assert!(html.contains(r#"class="kill""#));
         assert!(html.contains(r#"data-id="s-42""#));
         assert!(html.contains(r#"aria-label="Delete session""#));
-        // The inline script POSTs to /sessions/{id}/delete for that id.
-        assert!(html.contains("'/sessions/' + encodeURIComponent(id) + '/delete'"));
+        // The delete JS is no longer inline — it loads from the same-origin asset
+        // so it satisfies the strict `script-src 'self'` CSP.
+        assert!(html.contains(r#"<script src="/assets/dashboard.js""#));
+        assert!(!html.contains("<script>"));
+        // The route text lives in the external bundle, not the page.
+        assert!(dashboard_js().contains("'/sessions/' + encodeURIComponent(id) + '/delete'"));
     }
 
     #[test]
@@ -3498,6 +3610,9 @@ mod tests {
         // Button is no longer JS-gated: it must render without `disabled`.
         assert!(html.contains(r#"<button type="submit" class="pr-danger-btn">"#));
         assert!(!html.contains(r#"class="pr-danger-btn" disabled"#));
+        // The slow close-all submit carries the loading-overlay hook.
+        assert!(html.contains("data-loading="));
+        assert!(html.contains(r#"data-loading-btn="Closing…""#));
     }
 
     /// A matcher with fixed config, independent of the environment, for the
@@ -3743,6 +3858,58 @@ mod tests {
         assert!(html.contains(r#"name="confirm""#));
         // The exact argv is shown for audit, never a shell string.
         assert!(html.contains("jules-pr-triage"));
+        // The slow /tools/run submits carry the loading-overlay hook (both the
+        // read-only plain form and the destructive confirm form).
+        assert!(html.contains(r#"data-loading="Running"#));
+        assert!(html.contains(r#"data-loading-btn="Running…""#));
+    }
+
+    #[test]
+    fn dashboard_js_asset_bundles_every_behaviour() {
+        // The external bundle carries the delete control, the type-to-confirm
+        // logic, and the submit-loading overlay — all as non-inline JS so the
+        // `script-src 'self'` CSP admits them.
+        let js = dashboard_js();
+        assert!(js.contains("'/sessions/' + encodeURIComponent(id) + '/delete'"));
+        assert!(js.contains(".pr-confirm-input"));
+        assert!(js.contains("form[data-loading]"));
+        assert!(js.contains("loading-overlay"));
+        // Everything is event-delegated on the document, so it survives the tab
+        // re-renders / 10s refresh without re-binding.
+        assert!(js.contains("document.addEventListener('click'"));
+        assert!(js.contains("document.addEventListener('input'"));
+        assert!(js.contains("document.addEventListener('submit'"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_js_asset_handler_serves_javascript() {
+        let response = dashboard_js_asset().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/javascript"),
+            "content-type = {content_type}"
+        );
+        // The served body is exactly the non-empty JS bundle.
+        assert!(dashboard_js().contains("addEventListener"));
+    }
+
+    #[test]
+    fn page_shell_links_external_js_and_has_no_inline_script() {
+        let html = page_shell("t", &html! { p { "hi" } }, false).into_string();
+        // The page references the same-origin asset, never an inline script body.
+        assert!(html.contains(r#"<script src="/assets/dashboard.js""#));
+        assert!(
+            !html.contains("<script>"),
+            "page must not emit any inline <script> body under script-src 'self'"
+        );
+        // The loading overlay markup + spinner are present (hidden) on every page.
+        assert!(html.contains(r#"id="loading-overlay""#));
+        assert!(html.contains("loading-spinner"));
     }
 
     #[test]
