@@ -74,6 +74,8 @@ struct RawUser {
 struct RawHead {
     #[serde(rename = "ref", default)]
     ref_: String,
+    #[serde(default)]
+    sha: String,
 }
 
 /// Raw PR shape as returned by the GitHub pulls endpoint. Flattened into the
@@ -113,6 +115,8 @@ pub struct Pr {
     pub author_login: String,
     /// Head branch name (`head.ref`).
     pub head_ref: String,
+    /// Head commit SHA (`head.sha`), used to query check runs.
+    pub head_sha: String,
 }
 
 impl From<RawPr> for Pr {
@@ -125,6 +129,7 @@ impl From<RawPr> for Pr {
             created_at: raw.created_at,
             author_login: raw.user.login,
             head_ref: raw.head.ref_,
+            head_sha: raw.head.sha,
         }
     }
 }
@@ -135,6 +140,127 @@ impl<'de> Deserialize<'de> for Pr {
         D: Deserializer<'de>,
     {
         RawPr::deserialize(deserializer).map(Pr::from)
+    }
+}
+
+/// Detailed, single-PR view from `GET /repos/{o}/{r}/pulls/{n}`. Carries the
+/// mergeability and diff-size signals the triage evaluator needs, which the
+/// pulls *list* endpoint omits.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrDetail {
+    /// PR number within the repository.
+    pub number: u64,
+    /// GitHub's boolean mergeability, when computed. `None` while GitHub is
+    /// still computing the merge state in the background.
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+    /// GitHub's `mergeable_state` string (`clean`, `dirty`, `blocked`,
+    /// `behind`, `unstable`, `unknown`, …).
+    #[serde(default)]
+    pub mergeable_state: String,
+    /// Total lines added across the PR.
+    #[serde(default)]
+    pub additions: u64,
+    /// Total lines deleted across the PR.
+    #[serde(default)]
+    pub deletions: u64,
+    /// Number of files changed by the PR.
+    #[serde(default)]
+    pub changed_files: u64,
+    /// Head commit SHA (`head.sha`), used to query check runs.
+    #[serde(default, rename = "head")]
+    head: RawHead,
+}
+
+impl PrDetail {
+    /// Head commit SHA (`head.sha`) for this PR.
+    #[must_use]
+    pub fn head_sha(&self) -> &str {
+        &self.head.sha
+    }
+}
+
+/// A single check run's relevant fields.
+#[derive(Debug, Clone, Deserialize)]
+struct RawCheckRun {
+    /// `queued`, `in_progress`, or `completed`.
+    #[serde(default)]
+    status: String,
+    /// `success`, `failure`, `neutral`, `cancelled`, `timed_out`,
+    /// `action_required`, `skipped`, `stale`, … Present once `completed`.
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// Envelope for `GET /commits/{sha}/check-runs`.
+#[derive(Debug, Clone, Deserialize)]
+struct RawCheckRunsResponse {
+    #[serde(default)]
+    check_runs: Vec<RawCheckRun>,
+}
+
+/// Summary of the check runs for a commit: total count, a per-conclusion
+/// tally, and how many are still running. Built by [`CheckSummary::from_runs`]
+/// so the counting logic is pure and unit-testable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckSummary {
+    /// Total number of check runs reported.
+    pub total: usize,
+    /// Check runs with `conclusion == "success"`.
+    pub success: usize,
+    /// Check runs with `conclusion == "failure"`, `"timed_out"`,
+    /// `"cancelled"`, `"action_required"`, or `"startup_failure"`.
+    pub failure: usize,
+    /// Check runs with `conclusion == "neutral"` or `"skipped"`.
+    pub neutral: usize,
+    /// Check runs not yet `completed` (`queued` / `in_progress`).
+    pub running: usize,
+}
+
+impl CheckSummary {
+    /// Whether any check run reached a failing conclusion.
+    #[must_use]
+    pub fn has_failure(&self) -> bool {
+        self.failure > 0
+    }
+
+    /// Whether every check run completed successfully (and there is at least
+    /// one).
+    #[must_use]
+    pub fn all_success(&self) -> bool {
+        self.total > 0 && self.success == self.total
+    }
+
+    /// Whether any check run is still queued or in progress.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running > 0
+    }
+
+    /// Build a summary from raw check-run rows. `status != "completed"` counts
+    /// as still-running regardless of any (absent) conclusion; otherwise the
+    /// `conclusion` string is bucketed into success / failure / neutral.
+    fn from_runs(runs: &[RawCheckRun]) -> CheckSummary {
+        let mut summary = CheckSummary {
+            total: runs.len(),
+            ..CheckSummary::default()
+        };
+        for run in runs {
+            if run.status != "completed" {
+                summary.running += 1;
+                continue;
+            }
+            match run.conclusion.as_deref() {
+                Some("success") => summary.success += 1,
+                Some(
+                    "failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure",
+                ) => summary.failure += 1,
+                // `neutral`/`skipped`/`stale`, or an unknown/missing conclusion
+                // on a completed run, are counted as neutral rather than failing.
+                _ => summary.neutral += 1,
+            }
+        }
+        summary
     }
 }
 
@@ -253,6 +379,53 @@ impl GithubClient {
             Err(Self::api_error(response).await)
         }
     }
+
+    /// Fetch the detailed view of a single pull request
+    /// (`GET .../pulls/{number}`). Unlike the pulls-list endpoint, this returns
+    /// `mergeable`, `mergeable_state`, and the diff-size counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GithubError`] on transport failure, a non-success status, or a
+    /// response body that cannot be decoded.
+    pub async fn get_pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrDetail, GithubError> {
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}", self.base_url);
+        let response = self.authorized(self.http.get(&url)).send().await?;
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+        Ok(response.json().await?)
+    }
+
+    /// List the check runs for a commit (`GET .../commits/{sha}/check-runs`)
+    /// and summarize them by conclusion and status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GithubError`] on transport failure, a non-success status, or a
+    /// response body that cannot be decoded.
+    pub async fn list_check_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<CheckSummary, GithubError> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={PER_PAGE}",
+            self.base_url
+        );
+        let response = self.authorized(self.http.get(&url)).send().await?;
+        if !response.status().is_success() {
+            return Err(Self::api_error(response).await);
+        }
+        let body: RawCheckRunsResponse = response.json().await?;
+        Ok(CheckSummary::from_runs(&body.check_runs))
+    }
 }
 
 /// Classifies a pull request as Jules-authored or not. Pure and configurable so
@@ -338,6 +511,7 @@ mod tests {
             created_at: "2026-07-01T00:00:00Z".to_string(),
             author_login: author.to_string(),
             head_ref: "nova-x".to_string(),
+            head_sha: "cafef00d".to_string(),
         }
     }
 
@@ -393,6 +567,7 @@ mod tests {
         assert_eq!(pr.title, "nova: tidy up imports");
         assert_eq!(pr.author_login, "madmax983");
         assert_eq!(pr.head_ref, "nova/tidy-imports");
+        assert_eq!(pr.head_sha, "deadbeef");
         assert_eq!(
             pr.html_url,
             "https://github.com/madmax983/jules-rs/pull/4321"
@@ -403,6 +578,94 @@ mod tests {
         // The matcher flags it via the body marker even though the author is a
         // human account.
         assert!(matcher().is_jules(&pr));
+    }
+
+    #[test]
+    fn get_pull_maps_mergeability_and_diffstat_fields() {
+        let json = r#"{
+            "number": 512,
+            "state": "open",
+            "mergeable": true,
+            "mergeable_state": "clean",
+            "additions": 42,
+            "deletions": 7,
+            "changed_files": 3,
+            "head": { "ref": "nova/fix", "sha": "abc123" }
+        }"#;
+        let detail: PrDetail = serde_json::from_str(json).expect("valid PR detail JSON");
+        assert_eq!(detail.number, 512);
+        assert_eq!(detail.mergeable, Some(true));
+        assert_eq!(detail.mergeable_state, "clean");
+        assert_eq!(detail.additions, 42);
+        assert_eq!(detail.deletions, 7);
+        assert_eq!(detail.changed_files, 3);
+        assert_eq!(detail.head_sha(), "abc123");
+    }
+
+    #[test]
+    fn get_pull_tolerates_null_mergeable_and_missing_fields() {
+        // GitHub returns mergeable: null while it computes the merge state.
+        let json = r#"{
+            "number": 7,
+            "mergeable": null,
+            "mergeable_state": "unknown"
+        }"#;
+        let detail: PrDetail = serde_json::from_str(json).expect("valid PR detail JSON");
+        assert_eq!(detail.number, 7);
+        assert_eq!(detail.mergeable, None);
+        assert_eq!(detail.mergeable_state, "unknown");
+        assert_eq!(detail.additions, 0);
+        assert_eq!(detail.deletions, 0);
+        assert_eq!(detail.changed_files, 0);
+        assert_eq!(detail.head_sha(), "");
+    }
+
+    #[test]
+    fn check_runs_summary_buckets_conclusions_and_status() {
+        let json = r#"{
+            "total_count": 5,
+            "check_runs": [
+                { "name": "build",  "status": "completed",  "conclusion": "success" },
+                { "name": "test",   "status": "completed",  "conclusion": "failure" },
+                { "name": "lint",   "status": "completed",  "conclusion": "neutral" },
+                { "name": "deploy", "status": "in_progress", "conclusion": null },
+                { "name": "docs",   "status": "queued",      "conclusion": null }
+            ]
+        }"#;
+        let body: RawCheckRunsResponse = serde_json::from_str(json).expect("valid check-runs JSON");
+        let summary = CheckSummary::from_runs(&body.check_runs);
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.success, 1);
+        assert_eq!(summary.failure, 1);
+        assert_eq!(summary.neutral, 1);
+        assert_eq!(summary.running, 2);
+        assert!(summary.has_failure());
+        assert!(summary.is_running());
+        assert!(!summary.all_success());
+    }
+
+    #[test]
+    fn check_runs_summary_all_success() {
+        let json = r#"{
+            "check_runs": [
+                { "status": "completed", "conclusion": "success" },
+                { "status": "completed", "conclusion": "success" }
+            ]
+        }"#;
+        let body: RawCheckRunsResponse = serde_json::from_str(json).expect("valid check-runs JSON");
+        let summary = CheckSummary::from_runs(&body.check_runs);
+        assert!(summary.all_success());
+        assert!(!summary.has_failure());
+        assert!(!summary.is_running());
+    }
+
+    #[test]
+    fn check_runs_summary_empty_is_not_all_success() {
+        let summary = CheckSummary::from_runs(&[]);
+        assert_eq!(summary.total, 0);
+        assert!(!summary.all_success());
+        assert!(!summary.has_failure());
+        assert!(!summary.is_running());
     }
 
     #[test]

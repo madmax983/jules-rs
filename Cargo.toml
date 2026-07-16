@@ -19,6 +19,7 @@ heatmap = ["analytics"]
 reviewer = []
 risk_heatmap = ["reviewer", "heatmap"]
 web = ["dep:autumn-web", "dep:maud"]
+triage = ["reviewer"]
 
 [dependencies]
 fs2 = "0.4.3"
@@ -54,6 +55,11 @@ required-features = ["player"]
 name = "jules-web"
 path = "src/bin/web.rs"
 required-features = ["web"]
+
+[[bin]]
+name = "jules-pr-triage"
+path = "src/bin/pr_triage.rs"
+required-features = ["triage"]
 
 [lints.rust]
 unsafe_code = "warn"
