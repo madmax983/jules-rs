@@ -122,7 +122,8 @@ pub async fn run() -> Result<(), String> {
             index,
             api_summary,
             delete_session_route,
-            close_all_prs
+            close_all_prs,
+            run_tool
         ])
         .run()
         .await;
@@ -1165,12 +1166,13 @@ fn render_error(message: &str) -> Markup {
 }
 
 /// The tabs shown in the dashboard nav, in display order: `(slug, label)`.
-const TABS: [(&str, &str); 5] = [
+const TABS: [(&str, &str); 6] = [
     ("in-progress", "In Progress"),
     ("overview", "Overview"),
     ("sessions", "Sessions"),
     ("schedule", "Schedule"),
     ("prs", "PRs"),
+    ("tools", "Tools"),
 ];
 
 /// Resolve the selected tab slug from the query params, defaulting to the
@@ -1181,6 +1183,7 @@ fn selected_tab(params: &IndexParams) -> &'static str {
         Some("sessions") => "sessions",
         Some("schedule") => "schedule",
         Some("prs") => "prs",
+        Some("tools") => "tools",
         _ => "in-progress",
     }
 }
@@ -1260,6 +1263,11 @@ fn render_dashboard(
     let active = selected_tab(params);
     if active == "prs" {
         return render_prs_dashboard(&[], false);
+    }
+    if active == "tools" {
+        // Tools render from a fixed, static allowlist — no async or network — and
+        // never auto-refresh (so a confirmation isn't cleared on a timer).
+        return dashboard_page("tools", &render_tools(false), false);
     }
     let body = match active {
         "overview" => render_overview(sessions, labels),
@@ -2040,6 +2048,419 @@ fn render_close_error(message: &str) -> Markup {
     )
 }
 
+// ── Tools tab ────────────────────────────────────────────────────
+//
+// The Tools tab runs the repository's existing operational commands from the
+// dashboard. Security-critical invariant: the browser only ever sends a stable
+// tool `id` (and, for destructive tools, a confirmation string). The server maps
+// that id to a fixed argv from the hardcoded [`ALL_TOOLS`] table below — there is
+// NO string interpolation of client input into the command and NO shell. This is
+// the whole point: it makes command injection structurally impossible.
+
+/// Stable identifier for an allowlisted tool. The browser sends the slug (see
+/// [`ToolSpec::slug`]); the server maps it to a fixed [`ToolSpec`]. Matched
+/// exhaustively in [`tool_spec`] so adding a variant is a compile error until it
+/// has an argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolId {
+    /// Dry-run PR triage report (heuristic mode — no `ANTHROPIC_API_KEY`).
+    PrTriageReport,
+    /// Read-only director status (reads the local state file; no API/network).
+    DirectorStatus,
+    /// Reap stale queued Jules sessions. Destructive.
+    DeleteStaleQueued,
+    /// Delete completed Jules sessions. Destructive.
+    DeleteCompleted,
+}
+
+/// Every allowlisted tool, in display order. The single source of truth for the
+/// Tools tab and the `/tools/run` handler.
+const ALL_TOOLS: [ToolId; 4] = [
+    ToolId::PrTriageReport,
+    ToolId::DirectorStatus,
+    ToolId::DeleteStaleQueued,
+    ToolId::DeleteCompleted,
+];
+
+/// A fully-resolved tool: its stable slug, display metadata, the exact argv to
+/// run (no shell, no client input), and whether it is destructive. Built only by
+/// [`tool_spec`] from a hardcoded [`ToolId`] — never from client input.
+struct ToolSpec {
+    /// Stable id sent by the browser and echoed as the confirmation token.
+    slug: &'static str,
+    name: &'static str,
+    description: &'static str,
+    /// The exact command + args to execute. `argv[0]` is the program; the rest
+    /// are passed verbatim as separate arguments (never joined into a shell).
+    argv: Vec<&'static str>,
+    /// Destructive tools require a typed confirmation equal to [`ToolSpec::slug`].
+    destructive: bool,
+}
+
+impl ToolSpec {
+    /// The fixed argv as owned `String`s, ready to hand to [`execute_tool`].
+    fn argv_owned(&self) -> Vec<String> {
+        self.argv.iter().copied().map(String::from).collect()
+    }
+}
+
+/// Map a hardcoded [`ToolId`] to its fixed [`ToolSpec`]. Exhaustive match: every
+/// variant maps to a concrete, auditable argv, and no argv contains any
+/// client-supplied text. This is the security boundary for the Tools tab.
+fn tool_spec(id: ToolId) -> ToolSpec {
+    match id {
+        ToolId::PrTriageReport => ToolSpec {
+            slug: "pr-triage-report",
+            name: "PR triage report (dry-run)",
+            description: "Scan open Jules-authored PRs and write a merge / close / \
+                          needs-human report. Heuristic mode only — read-only, and never \
+                          closes or merges anything.",
+            argv: vec![
+                "cargo", "run", "--quiet", "--features", "triage", "--bin",
+                "jules-pr-triage", "--", "--mode", "heuristic",
+            ],
+            destructive: false,
+        },
+        ToolId::DirectorStatus => ToolSpec {
+            slug: "director-status",
+            name: "Director status",
+            description: "Print the autonomous director's current task state from the \
+                          local state file. Read-only — no API key and no network.",
+            argv: vec!["cargo", "run", "--quiet", "--bin", "director", "--", "status"],
+            destructive: false,
+        },
+        ToolId::DeleteStaleQueued => ToolSpec {
+            slug: "delete-stale-queued",
+            name: "Reap stale queued sessions",
+            description: "Delete queued Jules sessions older than the configured age \
+                          (JULES_STALE_MAX_AGE_HOURS, default 24h). Destructive.",
+            argv: vec!["cargo", "run", "--quiet", "--example", "delete_stale_queued_sessions"],
+            destructive: true,
+        },
+        ToolId::DeleteCompleted => ToolSpec {
+            slug: "delete-completed",
+            name: "Delete completed sessions",
+            description: "Delete every completed Jules session across all repos. \
+                          Destructive.",
+            argv: vec!["cargo", "run", "--quiet", "--example", "delete_completed_sessions"],
+            destructive: true,
+        },
+    }
+}
+
+/// Resolve a client-supplied slug to a [`ToolId`], or `None` for anything not in
+/// the allowlist. Unknown slugs are never executed.
+fn tool_from_slug(slug: &str) -> Option<ToolId> {
+    ALL_TOOLS
+        .into_iter()
+        .find(|&id| tool_spec(id).slug == slug)
+}
+
+/// Outcome of a `/tools/run` request. Every branch — including the rejected ones
+/// (unknown tool, failed confirmation) — is represented so the results page is
+/// always explicit about what did (or did not) run.
+enum ToolStatus {
+    /// The process exited with this code (`0` = success).
+    Exited(i32),
+    /// The process ran past the timeout and was killed (seconds shown).
+    TimedOut(u64),
+    /// The process terminated without an exit code (e.g. a signal).
+    NoExitCode,
+    /// The request named a tool not in the allowlist — nothing was executed.
+    UnknownTool(String),
+    /// A destructive tool whose confirmation did not match — nothing executed.
+    ConfirmFailed,
+    /// The process could not be spawned at all.
+    SpawnFailed(String),
+}
+
+/// Pure, render-ready result of a `/tools/run` request. Decoupled from both the
+/// process layer and Maud so the rendering is unit-testable without spawning
+/// anything.
+struct ToolResult {
+    /// Display name of the tool (or the raw id for an unknown tool).
+    name: String,
+    /// The exact argv that was (or would have been) executed, for audit.
+    argv: Vec<String>,
+    status: ToolStatus,
+    /// Captured stdout — rendered with Maud's DEFAULT escaping (never `PreEscaped`).
+    stdout: String,
+    /// Captured stderr — rendered with Maud's DEFAULT escaping.
+    stderr: String,
+}
+
+impl ToolResult {
+    /// Build a result for a run that produced no output — a rejected request
+    /// (unknown tool, failed confirmation) or a process that never ran to
+    /// completion (spawn/wait error, timeout).
+    fn without_output(name: String, argv: Vec<String>, status: ToolStatus) -> Self {
+        ToolResult {
+            name,
+            argv,
+            status,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
+/// A one-line human/audit label for a [`ToolStatus`]. Used both on the results
+/// page and in the `[tools]` diagnostic line.
+fn status_label(status: &ToolStatus) -> String {
+    match status {
+        ToolStatus::Exited(0) => "exited 0 (success)".to_string(),
+        ToolStatus::Exited(code) => format!("exited {code} (non-zero)"),
+        ToolStatus::TimedOut(secs) => {
+            format!("timed out after {secs}s — the process was killed")
+        }
+        ToolStatus::NoExitCode => "terminated without an exit code (signal)".to_string(),
+        ToolStatus::UnknownTool(id) => format!("unknown tool `{id}` — nothing was executed"),
+        ToolStatus::ConfirmFailed => {
+            "confirmation did not match — nothing was executed".to_string()
+        }
+        ToolStatus::SpawnFailed(error) => format!("failed to launch: {error}"),
+    }
+}
+
+/// Wall-clock cap on a single tool run. On expiry the child is killed (via
+/// `kill_on_drop`) and the run is reported as [`ToolStatus::TimedOut`].
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Launch `argv` with [`tokio::process`] — args passed as a vector, inheriting
+/// the server environment, with NO shell — under a [`TOOL_TIMEOUT`] timeout, and
+/// capture stdout + stderr. `argv[0]` is the program; the rest are literal args.
+/// The caller has already resolved `argv` from the hardcoded allowlist, so no
+/// client input reaches this function.
+async fn execute_tool(name: &str, argv: Vec<String>) -> ToolResult {
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Ensure a timed-out (dropped) child is killed rather than left running.
+        .kill_on_drop(true);
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ToolResult::without_output(
+                name.to_string(),
+                argv,
+                ToolStatus::SpawnFailed(error.to_string()),
+            );
+        }
+    };
+
+    match tokio::time::timeout(TOOL_TIMEOUT, child.wait_with_output()).await {
+        // Process finished within the timeout.
+        Ok(Ok(output)) => {
+            let status = match output.status.code() {
+                Some(code) => ToolStatus::Exited(code),
+                None => ToolStatus::NoExitCode,
+            };
+            ToolResult {
+                name: name.to_string(),
+                argv,
+                status,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+        }
+        // I/O error while waiting on the child.
+        Ok(Err(error)) => ToolResult::without_output(
+            name.to_string(),
+            argv,
+            ToolStatus::SpawnFailed(error.to_string()),
+        ),
+        // Timed out — dropping the `wait_with_output` future kills the child.
+        Err(_elapsed) => ToolResult::without_output(
+            name.to_string(),
+            argv,
+            ToolStatus::TimedOut(TOOL_TIMEOUT.as_secs()),
+        ),
+    }
+}
+
+/// Form fields `POSTed` by a Tools-tab card. The browser sends only the tool
+/// `slug` (and, for destructive tools, the typed `confirm`). No argv or command
+/// text ever comes from the client.
+#[derive(Debug, serde::Deserialize)]
+struct ToolRunForm {
+    /// Stable tool slug, looked up in the hardcoded allowlist server-side.
+    tool: String,
+    /// Typed confirmation for destructive tools (absent for read-only ones).
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// Run one allowlisted tool.
+///
+/// Security invariants enforced here, server-side:
+/// 1. `tool` is resolved against the hardcoded [`ALL_TOOLS`] allowlist. An
+///    unknown slug renders an error page and executes nothing.
+/// 2. A destructive tool requires `confirm` to equal its slug exactly (trimmed),
+///    or the request is rejected and nothing runs.
+/// 3. The command is the fixed argv from [`tool_spec`], launched via
+///    [`tokio::process`] with args as a vector and NO shell — so no client text
+///    is ever interpolated into the command line.
+///
+/// The handler always renders a results page (no auto-refresh) with the tool
+/// name, the exact argv (auditable), the exit status, and the captured output,
+/// and emits a `[tools]` diagnostic line.
+#[post("/tools/run")]
+async fn run_tool(Form(form): Form<ToolRunForm>) -> (StatusCode, Markup) {
+    // 1. Allowlist lookup. Unknown → error page, no execution.
+    let Some(id) = tool_from_slug(form.tool.trim()) else {
+        eprintln!("[tools] id={:?} unknown → nothing executed", form.tool);
+        let result = ToolResult::without_output(
+            form.tool.clone(),
+            Vec::new(),
+            ToolStatus::UnknownTool(form.tool.clone()),
+        );
+        return (StatusCode::BAD_REQUEST, render_tool_result(&result));
+    };
+
+    let spec = tool_spec(id);
+    let argv = spec.argv_owned();
+
+    // 2. Confirm gate for destructive tools.
+    if spec.destructive {
+        let confirm_ok = form.confirm.as_deref().map(str::trim) == Some(spec.slug);
+        if !confirm_ok {
+            eprintln!(
+                "[tools] id={} argv=[{}] confirm_ok=false → nothing executed",
+                spec.slug,
+                argv.join(" ")
+            );
+            let result =
+                ToolResult::without_output(spec.name.to_string(), argv, ToolStatus::ConfirmFailed);
+            return (StatusCode::BAD_REQUEST, render_tool_result(&result));
+        }
+    }
+
+    // 3. Launch the fixed argv — no shell, no client input.
+    let result = execute_tool(spec.name, argv).await;
+    eprintln!(
+        "[tools] id={} argv=[{}] status={}",
+        spec.slug,
+        result.argv.join(" "),
+        status_label(&result.status)
+    );
+
+    (StatusCode::OK, render_tool_result(&result))
+}
+
+/// Render the Tools tab body from the static allowlist. When `reveal` is set the
+/// destructive cards' confirm `<details>` render open (used by the demo
+/// screenshot); the live tab passes `false`.
+fn render_tools(reveal: bool) -> Markup {
+    html! {
+        section class="panel tools-intro" {
+            h2 { "Operational tools" }
+            p class="muted" {
+                "Run the repository's maintenance commands from the dashboard. Each card maps "
+                "to a fixed, server-side command — the browser only sends a tool id, so nothing "
+                "you type is ever interpolated into a shell. Destructive tools require you to "
+                "type the tool id to confirm."
+            }
+        }
+        div class="tool-grid" {
+            @for id in ALL_TOOLS {
+                (render_tool_card(&tool_spec(id), reveal))
+            }
+        }
+    }
+}
+
+/// Render one tool card: metadata, the exact argv (auditable), and either a
+/// plain POST button (read-only) or a type-to-confirm `<details>` mirroring the
+/// close-all confirm UX (destructive).
+fn render_tool_card(spec: &ToolSpec, reveal: bool) -> Markup {
+    let argv_display = spec.argv.join(" ");
+    html! {
+        section class="panel tool-card" {
+            div class="tool-head" {
+                span class="tool-name" { (spec.name) }
+                @if spec.destructive {
+                    span class="tool-tag tool-tag-danger" { "destructive" }
+                } @else {
+                    span class="tool-tag tool-tag-safe" { "read-only" }
+                }
+            }
+            p class="tool-desc muted" { (spec.description) }
+            div class="tool-argv mono" { (argv_display) }
+            @if spec.destructive {
+                details class="pr-confirm" open[reveal] {
+                    summary class="pr-toggle" { "Run " (spec.name) }
+                    form class="pr-form" method="post" action="/tools/run" {
+                        input type="hidden" name="tool" value=(spec.slug);
+                        p class="pr-warn" {
+                            "This runs a destructive maintenance command that may permanently "
+                            "delete sessions. This cannot be undone from here."
+                        }
+                        label class="pr-confirm-label" {
+                            "Type " code { (spec.slug) } " to confirm:"
+                            input class="pr-confirm-input" type="text" name="confirm"
+                                autocomplete="off" spellcheck="false"
+                                data-expect=(spec.slug) placeholder=(spec.slug);
+                        }
+                        button type="submit" class="pr-danger-btn" disabled {
+                            "Run " (spec.name)
+                        }
+                    }
+                }
+            } @else {
+                form class="tool-form" method="post" action="/tools/run" {
+                    input type="hidden" name="tool" value=(spec.slug);
+                    button type="submit" class="tool-run-btn" { "Run " (spec.name) }
+                }
+            }
+        }
+    }
+}
+
+/// Results page after a `/tools/run`. Always renders a clear outcome: the tool
+/// name, the exact argv, the status line, and the captured stdout/stderr in
+/// `<pre>` blocks using Maud's DEFAULT escaping (command output is never
+/// `PreEscaped`). No auto-refresh.
+fn render_tool_result(result: &ToolResult) -> Markup {
+    let argv_display = result.argv.join(" ");
+    let ok = matches!(result.status, ToolStatus::Exited(0));
+    page_shell(
+        "Jules Dashboard — tool result",
+        &html! {
+            header class="topbar" {
+                h1 { "Jules Dashboard" }
+            }
+            section class="panel" {
+                h2 { "Tool result — " (result.name) }
+                p class="tool-status" {
+                    span class=(if ok { "pr-ok" } else { "pr-fail" }) {
+                        (status_label(&result.status))
+                    }
+                }
+                @if !result.argv.is_empty() {
+                    div class="tool-argv mono" { (argv_display) }
+                }
+                @if !result.stdout.is_empty() {
+                    h3 class="tool-out-h" { "stdout" }
+                    pre class="tool-out" { (result.stdout) }
+                }
+                @if !result.stderr.is_empty() {
+                    h3 class="tool-out-h" { "stderr" }
+                    pre class="tool-out" { (result.stderr) }
+                }
+                @if result.stdout.is_empty() && result.stderr.is_empty() {
+                    p class="muted" { "No output was captured." }
+                }
+                p class="pr-back" { a href="/?tab=tools" { "← Back to Tools" } }
+            }
+        },
+        false,
+    )
+}
+
 /// Inline stylesheet for the dashboard (dark theme).
 const STYLES: &str = r"
 :root { color-scheme: dark; }
@@ -2427,6 +2848,63 @@ a:hover { text-decoration: underline; }
     border-radius: 8px;
 }
 .pr-back { margin-top: 18px; }
+.tools-intro h2 { color: #e2e8f0; font-size: 18px; }
+.tool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.tool-card { margin-bottom: 0; padding: 18px 20px; }
+.tool-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.tool-name { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+.tool-tag {
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.tool-tag-safe { background: #22c55e22; color: #86efac; border: 1px solid #22c55e55; }
+.tool-tag-danger { background: #ef444422; color: #fca5a5; border: 1px solid #ef444455; }
+.tool-desc { margin: 0 0 12px; font-size: 13px; line-height: 1.5; }
+.tool-argv {
+    background: #0b1120;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: #7dd3fc;
+    overflow-x: auto;
+    white-space: pre;
+    margin-bottom: 12px;
+}
+.tool-form { margin: 0; }
+.tool-run-btn {
+    align-self: flex-start;
+    padding: 9px 18px;
+    border-radius: 8px;
+    border: 1px solid #14532d;
+    background: #16a34a;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.tool-run-btn:hover { background: #15803d; }
+.tool-status { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+.tool-out-h { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #94a3b8; margin: 16px 0 6px; }
+.tool-out {
+    background: #0b1120;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 12px 14px;
+    color: #cbd5e1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 480px;
+    overflow-y: auto;
+}
 ";
 
 /// Inline script powering the per-row ✕ delete control. First click *arms* the
@@ -3137,6 +3615,128 @@ mod tests {
         assert_eq!(shown_numbers(&group), "12,10");
     }
 
+    // ── Tools tab ────────────────────────────────────────────────
+
+    #[test]
+    fn every_tool_id_maps_to_a_spec_and_round_trips() {
+        for id in ALL_TOOLS {
+            let spec = tool_spec(id);
+            assert!(!spec.slug.is_empty(), "slug must be non-empty");
+            assert!(!spec.name.is_empty(), "name must be non-empty");
+            assert!(!spec.argv.is_empty(), "argv must have at least a program");
+            // The slug the browser sends resolves back to this exact id.
+            assert_eq!(tool_from_slug(spec.slug), Some(id));
+            // No argv element carries interpolated/free-form placeholders.
+            assert!(spec.argv.iter().all(|arg| !arg.is_empty()));
+        }
+    }
+
+    #[test]
+    fn destructive_tools_are_flagged_read_only_are_not() {
+        assert!(tool_spec(ToolId::DeleteStaleQueued).destructive);
+        assert!(tool_spec(ToolId::DeleteCompleted).destructive);
+        assert!(!tool_spec(ToolId::PrTriageReport).destructive);
+        assert!(!tool_spec(ToolId::DirectorStatus).destructive);
+    }
+
+    #[test]
+    fn unknown_slug_resolves_to_none() {
+        assert_eq!(tool_from_slug("nope"), None);
+        assert_eq!(tool_from_slug(""), None);
+        // A confusable-but-wrong slug must not match.
+        assert_eq!(tool_from_slug("delete-stale"), None);
+    }
+
+    #[test]
+    fn tools_tab_renders_cards_and_confirm() {
+        let html = dashboard_page("tools", &render_tools(true), false).into_string();
+        assert!(html.contains("Operational tools"));
+        // Tab nav shows Tools active; no auto-refresh on this tab.
+        assert!(html.contains("/?tab=tools"));
+        assert!(!html.contains(r#"http-equiv="refresh""#));
+        // A read-only card posts to /tools/run with a plain button.
+        assert!(html.contains(r#"action="/tools/run""#));
+        assert!(html.contains(r#"value="pr-triage-report""#));
+        // A destructive card carries the type-to-confirm input keyed to its slug.
+        assert!(html.contains(r#"data-expect="delete-stale-queued""#));
+        assert!(html.contains(r#"name="confirm""#));
+        // The exact argv is shown for audit, never a shell string.
+        assert!(html.contains("jules-pr-triage"));
+    }
+
+    #[test]
+    fn tool_result_success_renders_status_and_output() {
+        let result = ToolResult {
+            name: "PR triage report".to_string(),
+            argv: vec!["cargo".to_string(), "run".to_string()],
+            status: ToolStatus::Exited(0),
+            stdout: "all good".to_string(),
+            stderr: String::new(),
+        };
+        let html = render_tool_result(&result).into_string();
+        assert!(html.contains("exited 0"));
+        assert!(html.contains("all good"));
+        assert!(html.contains("cargo run"));
+        assert!(!html.contains(r#"http-equiv="refresh""#));
+    }
+
+    #[test]
+    fn tool_result_nonzero_exit_shows_stderr() {
+        let result = ToolResult {
+            name: "Director status".to_string(),
+            argv: vec!["cargo".to_string()],
+            status: ToolStatus::Exited(12),
+            stdout: String::new(),
+            stderr: "state file not found".to_string(),
+        };
+        let html = render_tool_result(&result).into_string();
+        assert!(html.contains("exited 12 (non-zero)"));
+        assert!(html.contains("state file not found"));
+    }
+
+    #[test]
+    fn tool_result_timeout_is_reported() {
+        let result = ToolResult {
+            name: "Reap stale queued sessions".to_string(),
+            argv: vec!["cargo".to_string()],
+            status: ToolStatus::TimedOut(120),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let html = render_tool_result(&result).into_string();
+        assert!(html.contains("timed out after 120s"));
+        assert!(html.contains("No output was captured."));
+    }
+
+    #[test]
+    fn tool_result_unknown_tool_executes_nothing() {
+        let result = ToolResult {
+            name: "bogus".to_string(),
+            argv: Vec::new(),
+            status: ToolStatus::UnknownTool("bogus".to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let html = render_tool_result(&result).into_string();
+        assert!(html.contains("unknown tool `bogus`"));
+        assert!(html.contains("nothing was executed"));
+    }
+
+    #[test]
+    fn tool_output_is_html_escaped() {
+        // Command output must be escaped (default Maud), never PreEscaped.
+        let result = ToolResult {
+            name: "PR triage report".to_string(),
+            argv: vec!["cargo".to_string()],
+            status: ToolStatus::Exited(0),
+            stdout: "<script>alert('x')</script>".to_string(),
+            stderr: String::new(),
+        };
+        let html = render_tool_result(&result).into_string();
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>alert"));
+    }
+
     /// Sample PR groups for the demo screenshot and the render tests.
     fn sample_pr_groups() -> Vec<RepoPrGroup> {
         let view = |number: u64, title: &str, age: &str| PrView {
@@ -3316,6 +3916,38 @@ mod tests {
         // The PRs tab needs network-fetched data in the live server, so here it
         // renders from sample groups (with the confirm form visible) instead.
         let demo_tab = std::env::var("DEMO_TAB").ok();
+
+        // The Tools tab renders from the static allowlist (no sessions/network).
+        // It also emits a sample results page so both surfaces can be screenshot.
+        if demo_tab.as_deref() == Some("tools") {
+            let tab_html = dashboard_page("tools", &render_tools(true), false).into_string();
+            let out = std::env::var("DEMO_OUT").unwrap_or_else(|_| "tools.html".to_string());
+            std::fs::write(&out, tab_html).expect("write tools html");
+
+            // Synthetic successful run (exit 0 with some stdout) for the results page.
+            let triage = tool_spec(ToolId::PrTriageReport);
+            let sample = ToolResult {
+                name: triage.name.to_string(),
+                argv: triage.argv_owned(),
+                status: ToolStatus::Exited(0),
+                stdout: "Triaged 3 Jules PR(s): 1 merge / 1 close / 1 needs_human  \
+                         (dry-run — nothing was closed or merged)\n\
+                         REPO                             PR  REC            CONF  SOURCE\n\
+                         acme/api                      #4321  merge          0.92  heuristic\n\
+                         acme/web                       #210  close          0.81  heuristic\n\
+                         octo/cat                        #77  needs_human    0.55  heuristic\n\
+                         Report written to jules-pr-triage-report.md"
+                    .to_string(),
+                stderr: String::new(),
+            };
+            let result_html = render_tool_result(&sample).into_string();
+            let result_out =
+                std::env::var("DEMO_RESULT_OUT").unwrap_or_else(|_| "tools-result.html".to_string());
+            std::fs::write(&result_out, result_html).expect("write tools result html");
+            eprintln!("wrote {out} and {result_out} · tools tab + sample results page");
+            return;
+        }
+
         let html = if demo_tab.as_deref() == Some("prs") {
             render_prs_dashboard(&sample_pr_groups(), true).into_string()
         } else {
