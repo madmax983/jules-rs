@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use jules_rs::github::{CheckSummary, GithubClient, JulesMatcher, Pr};
 use jules_rs::triage::{
-    HeuristicEvaluator, LlmEvaluator, PrContext, Recommendation, SessionIndex, TriageMode,
-    TriageResult, evaluate_pr, render_report, task_id_from_body,
+    HeuristicEvaluator, LlmEvaluator, PrContext, SessionIndex, TriageMode, TriageResult,
+    evaluate_pr, render_report, tally, task_id_from_body,
 };
 use jules_rs::{
     AnthropicClient, JulesClient, ListSessionsParams, ListSourcesParams, Session, SessionReviewer,
@@ -409,16 +409,7 @@ fn derive_repos_from_sources(sources: &[Source]) -> Vec<(String, String)> {
 fn stdout_summary(results: &[TriageResult], out_path: &str) -> String {
     use std::fmt::Write as _;
 
-    let mut merge = 0;
-    let mut close = 0;
-    let mut needs_human = 0;
-    for result in results {
-        match result.verdict.recommendation {
-            Recommendation::Merge => merge += 1,
-            Recommendation::Close => close += 1,
-            Recommendation::NeedsHuman => needs_human += 1,
-        }
-    }
+    let (merge, close, needs_human) = tally(results);
 
     let mut out = String::new();
     let _ = writeln!(

@@ -586,7 +586,7 @@ pub struct TriageResult {
 
 /// Totals over a set of results: `(merge, close, needs_human)` counts.
 #[must_use]
-fn tally(results: &[TriageResult]) -> (usize, usize, usize) {
+pub fn tally(results: &[TriageResult]) -> (usize, usize, usize) {
     let mut merge = 0;
     let mut close = 0;
     let mut needs_human = 0;

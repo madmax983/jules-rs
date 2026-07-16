@@ -236,9 +236,7 @@ impl CheckSummary {
     pub fn is_running(&self) -> bool {
         self.running > 0
     }
-}
 
-impl CheckSummary {
     /// Build a summary from raw check-run rows. `status != "completed"` counts
     /// as still-running regardless of any (absent) conclusion; otherwise the
     /// `conclusion` string is bucketed into success / failure / neutral.
