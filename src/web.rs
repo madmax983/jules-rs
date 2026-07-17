@@ -3959,7 +3959,6 @@ mod tests {
         assert!(html.contains("/?tab=prs"));
         assert!(html.contains("/?tab=tools"));
         assert!(!html.contains("Could not load dashboard"));
-        assert!(!html.contains("Could not load dashboard"));
         // Auto-refresh stays on so the tab recovers when Jules returns.
         assert!(html.contains(r#"http-equiv="refresh""#));
     }
