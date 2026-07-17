@@ -23,10 +23,18 @@ use crate::{
     TimeoutPolicy,
 };
 
-/// Short-TTL for the in-memory dashboard cache. Slightly under the 10s
-/// meta-refresh so data stays fresh but rapid tab clicks (and the auto-refresh)
-/// are served from cache instead of re-hitting the Jules and GitHub APIs.
+/// Short-TTL for the Jules `list_sessions`/`list_sources` data (used by every
+/// session tab). Slightly under the 10s meta-refresh so data stays fresh but
+/// rapid tab clicks (and the auto-refresh) are served from cache instead of
+/// re-hitting the Jules API.
 const CACHE_TTL: Duration = Duration::from_secs(8);
+
+/// Much longer TTL for the per-repo GitHub PR listings. The cross-repo GitHub
+/// sweep is expensive, and the PRs tab does not auto-refresh, so the freshness
+/// window is generous: stale entries are served instantly and refreshed in the
+/// background, and the user forces a synchronous refetch via the "Refresh"
+/// control (`?tab=prs&refresh=1`) when they want up-to-the-second data.
+const PR_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// A value stamped with the [`Instant`] it was fetched, for TTL checks.
 struct TimedCache<T> {
@@ -42,12 +50,68 @@ struct DashboardCache {
     sessions: Option<TimedCache<Arc<Vec<Session>>>>,
     sources: Option<TimedCache<Arc<Vec<Source>>>>,
     prs: BTreeMap<(String, String), TimedCache<Arc<Vec<Pr>>>>,
+    /// Per-repo `(owner, repo)` keys whose PR listing has a background refresh
+    /// in flight. Guards against spawning duplicate concurrent refetches when a
+    /// stale entry is served on several near-simultaneous requests.
+    refreshing: BTreeSet<(String, String)>,
 }
 
 /// Whether a cache entry fetched at `fetched_at` is still fresh at `now` under
 /// `ttl`. Pure and unit-tested so the TTL logic needs no live fetches.
 fn is_fresh(fetched_at: Instant, now: Instant, ttl: Duration) -> bool {
     now.duration_since(fetched_at) < ttl
+}
+
+/// Freshness classification for a per-repo PR cache entry, driving the
+/// serve-stale + background-refresh path in [`fetch_pr_groups`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheState {
+    /// A recent fetch is still within `ttl` — serve it as-is, no refetch.
+    Fresh,
+    /// An entry exists but is older than `ttl` — serve it now, refresh in the
+    /// background.
+    Stale,
+    /// No entry at all — must be fetched synchronously before the first render.
+    Cold,
+}
+
+/// Classify a PR cache entry given its `fetched_at` (absent for a cold entry),
+/// the current `now`, and the `ttl`. Pure and unit-tested so the serve-stale
+/// decision needs no live fetches.
+fn cache_state(fetched_at: Option<Instant>, now: Instant, ttl: Duration) -> CacheState {
+    match fetched_at {
+        None => CacheState::Cold,
+        Some(at) if is_fresh(at, now, ttl) => CacheState::Fresh,
+        Some(_) => CacheState::Stale,
+    }
+}
+
+/// Remove the successfully-closed PR numbers from a cached repo listing in
+/// place, leaving every other PR (and the entry's fetch timestamp) untouched.
+/// Pure and unit-tested; called after a mass-close so returning to the PRs tab
+/// reflects the closes with no refetch.
+fn remove_closed(cached: &mut Vec<Pr>, closed_numbers: &[u64]) {
+    if closed_numbers.is_empty() {
+        return;
+    }
+    let closed: BTreeSet<u64> = closed_numbers.iter().copied().collect();
+    cached.retain(|pr| !closed.contains(&pr.number));
+}
+
+/// Format a cache-age [`Duration`] for the PRs-tab "data as of X" header, using
+/// integer math: `just now` under 5s, then `Ns ago` / `Nm ago` / `Nh ago`.
+/// Pure and unit-tested.
+fn format_age(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3_600)
+    }
 }
 
 /// Shared, process-wide request context. Built once at startup and read by the
@@ -230,46 +294,50 @@ async fn cached_sources(context: &WebContext) -> Result<Arc<Vec<Source>>, JulesE
     .await
 }
 
-/// List one repo's open pulls, served from the short-TTL cache when fresh. Used
-/// by the PRs-tab render only; the destructive close path always re-fetches
-/// live (uncached) so its re-classification is authoritative. The lock is never
-/// held across the `await`.
-async fn cached_open_pulls(
-    github: &GithubClient,
-    cache: &Mutex<DashboardCache>,
-    owner: &str,
-    repo: &str,
-) -> Result<Arc<Vec<Pr>>, crate::github::GithubError> {
+/// Mutate the cached PR listing for `owner/repo` in place after a mass-close:
+/// drop the successfully-closed PR numbers, keeping the rest and the entry's
+/// original `fetched_at` (the remaining data is still as-of that time). When no
+/// cache entry exists for the repo this is a no-op — the next visit fetches. The
+/// lock is held only for the synchronous mutation (no `await`).
+fn apply_pr_close(cache: &Mutex<DashboardCache>, owner: &str, repo: &str, closed_numbers: &[u64]) {
     let key = (owner.to_string(), repo.to_string());
-    let now = Instant::now();
-    {
-        let guard = lock_cache(cache);
-        if let Some(entry) = guard.prs.get(&key) {
-            if is_fresh(entry.fetched_at, now, CACHE_TTL) {
-                return Ok(Arc::clone(&entry.value));
-            }
-        }
+    let mut guard = lock_cache(cache);
+    if let Some(entry) = guard.prs.get_mut(&key) {
+        let prs = Arc::make_mut(&mut entry.value);
+        remove_closed(prs, closed_numbers);
     }
-    let fresh = Arc::new(github.list_open_pulls(owner, repo).await?);
-    {
-        let mut guard = lock_cache(cache);
-        guard.prs.insert(
-            key,
-            TimedCache {
-                fetched_at: Instant::now(),
-                value: Arc::clone(&fresh),
-            },
-        );
-    }
-    Ok(fresh)
 }
 
-/// Drop any cached PR listing for `owner/repo` so the next PRs-tab render
-/// re-fetches live. Called after a mass-close so the tab reflects the closes.
-fn invalidate_pr_cache(cache: &Mutex<DashboardCache>, owner: &str, repo: &str) {
-    lock_cache(cache)
-        .prs
-        .remove(&(owner.to_string(), repo.to_string()));
+/// Spawn a background task that refetches one repo's open pulls WITHOUT holding
+/// the cache lock across the network call, then locks only to store the fresh
+/// list (with a new `fetched_at`) and clear the repo's `refreshing` flag. On
+/// error the flag is cleared and the previously-served stale data is kept. The
+/// caller must have already inserted the repo's key into `refreshing` under the
+/// lock so only one refresh is ever in flight per repo.
+fn spawn_pr_refresh(
+    github: Arc<GithubClient>,
+    cache: Arc<Mutex<DashboardCache>>,
+    owner: String,
+    repo: String,
+) {
+    tokio::spawn(async move {
+        let key = (owner.clone(), repo.clone());
+        // The network call happens here, with NO lock held.
+        let result = github.list_open_pulls(&owner, &repo).await;
+        let mut guard = lock_cache(&cache);
+        if let Ok(prs) = result {
+            guard.prs.insert(
+                key.clone(),
+                TimedCache {
+                    fetched_at: Instant::now(),
+                    value: Arc::new(prs),
+                },
+            );
+        }
+        // Clear the in-flight flag whether the refresh succeeded or failed; a
+        // failure simply keeps the stale entry until the next refresh.
+        guard.refreshing.remove(&key);
+    });
 }
 
 // ── Pure aggregation helpers ─────────────────────────────────────
@@ -705,6 +773,9 @@ struct IndexParams {
     /// values fall back to the default `in-progress` landing view. Kept in the
     /// query string so the 10s meta-refresh preserves the active tab.
     tab: Option<String>,
+    /// When `1`, force a synchronous refetch of every repo's PR listing on the
+    /// PRs tab (the manual "Refresh" control), bypassing the long PR cache.
+    refresh: Option<String>,
 }
 
 /// A pre-rendered table row, decoupled from Maud so it stays unit-testable.
@@ -814,19 +885,22 @@ async fn index(Query(params): Query<IndexParams>) -> Markup {
     // when it is the selected tab so the other tabs stay fast.
     if selected_tab(&params) == "prs" {
         let Some(github) = context.github.as_ref() else {
-            return render_prs_dashboard(&[], false);
+            return render_prs_dashboard(&[], false, None);
         };
         let matcher = JulesMatcher::from_env();
         let repos = distinct_repos(&labels);
-        let groups = fetch_pr_groups(
+        let force = params.refresh.as_deref() == Some("1");
+        let (groups, oldest) = fetch_pr_groups(
             Arc::clone(github),
             Arc::clone(&context.cache),
             &matcher,
             repos,
             current_unix(),
+            force,
         )
         .await;
-        return render_prs_dashboard(&groups, true);
+        let age = oldest.map(|at| format_age(Instant::now().duration_since(at)));
+        return render_prs_dashboard(&groups, true, age.as_deref());
     }
 
     render_dashboard(&sessions, &labels, &params)
@@ -1033,9 +1107,18 @@ async fn close_all_prs(Form(form): Form<CloseAllForm>) -> (StatusCode, Markup) {
         summary.unmatched.len()
     );
 
-    // Reflect the closes on the PRs tab immediately.
+    // Reflect the closes on the PRs tab immediately by mutating the cached PR
+    // listing in place — drop exactly the PR numbers that closed successfully,
+    // keeping the rest and the entry's fetch time. Returning to the PRs tab then
+    // shows the updated list instantly with no GitHub refetch.
     if summary.closed > 0 {
-        invalidate_pr_cache(&context.cache, &owner, &repo);
+        let closed_numbers: Vec<u64> = summary
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.ok)
+            .map(|outcome| outcome.number)
+            .collect();
+        apply_pr_close(&context.cache, &owner, &repo, &closed_numbers);
     }
 
     (StatusCode::OK, render_close_result(&summary, &matcher))
@@ -1290,7 +1373,7 @@ fn render_dashboard(
 ) -> Markup {
     let active = selected_tab(params);
     if active == "prs" {
-        return render_prs_dashboard(&[], false);
+        return render_prs_dashboard(&[], false, None);
     }
     if active == "tools" {
         // Tools render from a fixed, static allowlist — no async or network — and
@@ -1308,9 +1391,9 @@ fn render_dashboard(
 
 /// Render the PRs tab inside the shared dashboard chrome. Takes already-fetched
 /// data so it stays synchronous and unit-testable; the `index` handler supplies
-/// the live groups, the demo test supplies sample groups.
-fn render_prs_dashboard(groups: &[RepoPrGroup], has_token: bool) -> Markup {
-    dashboard_page("prs", &render_prs(groups, has_token), false)
+/// the live groups plus the cache-age label, the demo test supplies sample data.
+fn render_prs_dashboard(groups: &[RepoPrGroup], has_token: bool, age: Option<&str>) -> Markup {
+    dashboard_page("prs", &render_prs(groups, has_token, age), false)
 }
 
 /// Dedicated In Progress landing view: every `InProgress` session across all
@@ -1746,27 +1829,91 @@ fn pr_view(pr: &Pr, now_unix: u64) -> PrView {
     }
 }
 
-/// Fetch open pulls for each repo in parallel (bounded concurrency), filter to
-/// Jules PRs, and group by repo. Repos that error or have zero Jules PRs are
-/// omitted. Groups are sorted by descending Jules-PR count, then repo label.
+/// A repo's PR listing paired with the [`Instant`] it was fetched, used to build
+/// the groups and compute the "data as of X" age from the oldest shown repo.
+type TimedPrs = (String, String, Arc<Vec<Pr>>, Instant);
+
+/// Fetch open pulls for each repo, filter to Jules PRs, and group by repo.
+///
+/// The per-repo GitHub listing is cached under [`PR_CACHE_TTL`]. For each repo:
+/// a **fresh** entry is served as-is; a **stale** entry is served immediately
+/// while a background [`tokio::task`] refetches it (guarded by a per-repo
+/// `refreshing` flag so only one refresh runs at a time); a **cold** repo (no
+/// entry yet) is fetched synchronously, in parallel across cold repos via a
+/// [`JoinSet`]. When `force` is set (the manual Refresh) every repo is refetched
+/// synchronously and the cache is reset.
+///
+/// Returns the groups (sorted by descending Jules-PR count, then repo label) and
+/// the oldest `fetched_at` among the shown repos, for the age header. The cache
+/// [`Mutex`] guard is never held across an `.await`.
 async fn fetch_pr_groups(
     github: Arc<GithubClient>,
     cache: Arc<Mutex<DashboardCache>>,
     matcher: &JulesMatcher,
     repos: Vec<(String, String)>,
     now_unix: u64,
-) -> Vec<RepoPrGroup> {
-    let mut groups: Vec<RepoPrGroup> = Vec::new();
+    force: bool,
+) -> (Vec<RepoPrGroup>, Option<Instant>) {
+    let now = Instant::now();
 
-    for chunk in repos.chunks(PR_FETCH_CONCURRENCY) {
+    // Phase 1: classify every repo under a single short lock (no await). Serve
+    // fresh + stale entries from cache, mark stale repos for background refresh,
+    // and collect the cold (or, when forced, all) repos to fetch synchronously.
+    let mut served: Vec<TimedPrs> = Vec::new();
+    let mut to_fetch: Vec<(String, String)> = Vec::new();
+    let mut to_refresh: Vec<(String, String)> = Vec::new();
+    {
+        let mut guard = lock_cache(&cache);
+        for (owner, repo) in repos {
+            let key = (owner.clone(), repo.clone());
+            if force {
+                to_fetch.push((owner, repo));
+                continue;
+            }
+            let fetched_at = guard.prs.get(&key).map(|entry| entry.fetched_at);
+            match cache_state(fetched_at, now, PR_CACHE_TTL) {
+                CacheState::Fresh => {
+                    if let Some(entry) = guard.prs.get(&key) {
+                        served.push((owner, repo, Arc::clone(&entry.value), entry.fetched_at));
+                    }
+                }
+                CacheState::Stale => {
+                    if let Some(entry) = guard.prs.get(&key) {
+                        served.push((
+                            owner.clone(),
+                            repo.clone(),
+                            Arc::clone(&entry.value),
+                            entry.fetched_at,
+                        ));
+                    }
+                    // Only queue a background refresh if one isn't already in
+                    // flight for this repo (insert returns true when newly added).
+                    if guard.refreshing.insert(key) {
+                        to_refresh.push((owner, repo));
+                    }
+                }
+                CacheState::Cold => to_fetch.push((owner, repo)),
+            }
+        }
+    }
+
+    // Phase 2: kick off background refreshes for the stale repos. Each fetches
+    // without holding the lock and stores the fresh list when it completes.
+    for (owner, repo) in to_refresh {
+        spawn_pr_refresh(Arc::clone(&github), Arc::clone(&cache), owner, repo);
+    }
+
+    // Phase 3: synchronously fetch cold (or, when forced, all) repos in parallel
+    // — there is nothing stale to serve for these, so the first render must wait.
+    let mut fetched: Vec<TimedPrs> = Vec::new();
+    for chunk in to_fetch.chunks(PR_FETCH_CONCURRENCY) {
         let mut set: JoinSet<PrFetchResult> = JoinSet::new();
         for (owner, repo) in chunk {
             let github = Arc::clone(&github);
-            let cache = Arc::clone(&cache);
             let owner = owner.clone();
             let repo = repo.clone();
             set.spawn(async move {
-                let result = cached_open_pulls(&github, &cache, &owner, &repo).await;
+                let result = github.list_open_pulls(&owner, &repo).await.map(Arc::new);
                 (owner, repo, result)
             });
         }
@@ -1774,18 +1921,38 @@ async fn fetch_pr_groups(
             let Ok((owner, repo, Ok(prs))) = joined else {
                 continue;
             };
-            let mut views: Vec<PrView> = prs
-                .iter()
-                .filter(|pr| matcher.is_jules(pr))
-                .map(|pr| pr_view(pr, now_unix))
-                .collect();
-            if views.is_empty() {
-                continue;
+            let fetched_at = Instant::now();
+            {
+                let mut guard = lock_cache(&cache);
+                guard.prs.insert(
+                    (owner.clone(), repo.clone()),
+                    TimedCache {
+                        fetched_at,
+                        value: Arc::clone(&prs),
+                    },
+                );
             }
-            // Newest PR number first within a repo.
-            views.sort_by(|a, b| b.number.cmp(&a.number));
-            groups.push(RepoPrGroup { owner, repo, prs: views });
+            fetched.push((owner, repo, prs, fetched_at));
         }
+    }
+
+    // Phase 4: build the Jules-only groups, tracking the oldest fetch time among
+    // repos that actually surface a group (the "data as of X" age).
+    let mut groups: Vec<RepoPrGroup> = Vec::new();
+    let mut oldest: Option<Instant> = None;
+    for (owner, repo, prs, fetched_at) in served.into_iter().chain(fetched) {
+        let mut views: Vec<PrView> = prs
+            .iter()
+            .filter(|pr| matcher.is_jules(pr))
+            .map(|pr| pr_view(pr, now_unix))
+            .collect();
+        if views.is_empty() {
+            continue;
+        }
+        // Newest PR number first within a repo.
+        views.sort_by(|a, b| b.number.cmp(&a.number));
+        oldest = Some(oldest.map_or(fetched_at, |current| current.min(fetched_at)));
+        groups.push(RepoPrGroup { owner, repo, prs: views });
     }
 
     groups.sort_by(|a, b| {
@@ -1794,7 +1961,7 @@ async fn fetch_pr_groups(
             .cmp(&a.prs.len())
             .then_with(|| a.label().cmp(&b.label()))
     });
-    groups
+    (groups, oldest)
 }
 
 /// Close each target PR (bounded concurrency), optionally deleting its head
@@ -1865,8 +2032,10 @@ fn pr_word(count: usize) -> &'static str {
     if count == 1 { "PR" } else { "PRs" }
 }
 
-/// Render the PRs tab body from already-fetched data.
-fn render_prs(groups: &[RepoPrGroup], has_token: bool) -> Markup {
+/// Render the PRs tab body from already-fetched data. `age` is the formatted
+/// "data as of X" label for the oldest shown repo (absent when nothing is
+/// cached), rendered alongside the manual Refresh control.
+fn render_prs(groups: &[RepoPrGroup], has_token: bool, age: Option<&str>) -> Markup {
     if !has_token {
         return html! {
             section class="panel pr-notice" {
@@ -1888,6 +2057,17 @@ fn render_prs(groups: &[RepoPrGroup], has_token: bool) -> Markup {
     let total: usize = groups.iter().map(|group| group.prs.len()).sum();
 
     html! {
+        div class="pr-refresh-bar" {
+            span class="muted" {
+                @if let Some(age) = age {
+                    "PR data as of " (age)
+                } @else {
+                    "PR data — not yet loaded"
+                }
+            }
+            " · "
+            a class="pr-refresh-link" href="/?tab=prs&refresh=1" { "Refresh" }
+        }
         @if groups.is_empty() {
             section class="panel" {
                 p class="empty" {
@@ -2776,6 +2956,23 @@ a:hover { text-decoration: underline; }
     font-size: 12px;
     color: #7dd3fc;
 }
+.pr-refresh-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 14px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+.pr-refresh-link {
+    font-weight: 600;
+    color: #7dd3fc;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid #1e293b;
+    background: #0f1a30;
+}
+.pr-refresh-link:hover { text-decoration: none; border-color: #38bdf8; background: #111a2e; }
 .pr-headline h2 { color: #e2e8f0; font-size: 18px; }
 .pr-panel { padding: 16px 20px; }
 .pr-panel-head {
@@ -3576,24 +3773,29 @@ mod tests {
 
     #[test]
     fn prs_tab_without_token_shows_setup_notice() {
-        let html = render_prs(&[], false).into_string();
+        let html = render_prs(&[], false, None).into_string();
         assert!(html.contains("GITHUB_TOKEN"));
         assert!(html.contains("JULES_PR_AUTHORS"));
     }
 
     #[test]
     fn prs_tab_with_token_empty_shows_clean_state() {
-        let html = render_prs(&[], true).into_string();
+        let html = render_prs(&[], true, None).into_string();
         assert!(html.contains("No open Jules PRs"));
     }
 
     #[test]
     fn prs_tab_renders_groups_and_confirm_form() {
         let groups = sample_pr_groups();
-        let html = render_prs_dashboard(&groups, true).into_string();
+        let html = render_prs_dashboard(&groups, true, Some("3m ago")).into_string();
         // Tab nav shows PRs active, and no auto-refresh meta on this tab.
         assert!(html.contains("/?tab=prs"));
         assert!(!html.contains(r#"http-equiv="refresh""#));
+        // The "data as of X · Refresh" control renders with the age and a
+        // manual refresh link (a link, not a meta-refresh).
+        assert!(html.contains("PR data as of 3m ago"));
+        // The `&` is HTML-escaped to `&amp;` in the rendered href.
+        assert!(html.contains(r#"href="/?tab=prs&amp;refresh=1""#));
         // Headline + a repo panel with a count badge.
         assert!(html.contains("open Jules"));
         assert!(html.contains("acme/api"));
@@ -3786,6 +3988,80 @@ mod tests {
         // At/after TTL → stale.
         assert!(!is_fresh(start, start + Duration::from_secs(8), ttl));
         assert!(!is_fresh(start, start + Duration::from_secs(20), ttl));
+    }
+
+    #[test]
+    fn cache_state_classifies_cold_fresh_and_stale() {
+        let ttl = Duration::from_secs(300);
+        let now = Instant::now();
+        // No entry → cold, regardless of ttl.
+        assert_eq!(cache_state(None, now, ttl), CacheState::Cold);
+        // Fetched just now / within ttl → fresh.
+        assert_eq!(cache_state(Some(now), now, ttl), CacheState::Fresh);
+        assert_eq!(
+            cache_state(Some(now), now + Duration::from_secs(299), ttl),
+            CacheState::Fresh
+        );
+        // At/after ttl → stale.
+        assert_eq!(
+            cache_state(Some(now), now + Duration::from_secs(300), ttl),
+            CacheState::Stale
+        );
+        assert_eq!(
+            cache_state(Some(now), now + Duration::from_secs(9_000), ttl),
+            CacheState::Stale
+        );
+    }
+
+    #[test]
+    fn format_age_uses_integer_buckets() {
+        assert_eq!(format_age(Duration::from_secs(0)), "just now");
+        assert_eq!(format_age(Duration::from_secs(4)), "just now");
+        assert_eq!(format_age(Duration::from_secs(5)), "5s ago");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(150)), "2m ago");
+        assert_eq!(format_age(Duration::from_secs(3_599)), "59m ago");
+        assert_eq!(format_age(Duration::from_secs(3_600)), "1h ago");
+        assert_eq!(format_age(Duration::from_secs(7_200)), "2h ago");
+    }
+
+    /// A minimal [`Pr`] with just the fields [`remove_closed`] inspects.
+    fn pr_num(number: u64) -> Pr {
+        Pr {
+            number,
+            title: format!("pr {number}"),
+            body: None,
+            html_url: String::new(),
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            author_login: "google-labs-jules[bot]".to_string(),
+            head_ref: String::new(),
+            head_sha: String::new(),
+        }
+    }
+
+    #[test]
+    fn remove_closed_drops_only_closed_numbers() {
+        let mut cached = vec![pr_num(10), pr_num(11), pr_num(12), pr_num(13)];
+        remove_closed(&mut cached, &[11, 13]);
+        let remaining: Vec<u64> = cached.iter().map(|pr| pr.number).collect();
+        assert_eq!(remaining, vec![10, 12]);
+    }
+
+    #[test]
+    fn remove_closed_empty_list_is_noop() {
+        let mut cached = vec![pr_num(1), pr_num(2)];
+        remove_closed(&mut cached, &[]);
+        let remaining: Vec<u64> = cached.iter().map(|pr| pr.number).collect();
+        assert_eq!(remaining, vec![1, 2]);
+    }
+
+    #[test]
+    fn remove_closed_ignores_numbers_not_present() {
+        let mut cached = vec![pr_num(5), pr_num(6)];
+        remove_closed(&mut cached, &[99, 6]);
+        let remaining: Vec<u64> = cached.iter().map(|pr| pr.number).collect();
+        assert_eq!(remaining, vec![5]);
     }
 
     #[test]
@@ -4197,7 +4473,7 @@ mod tests {
         }
 
         let html = if demo_tab.as_deref() == Some("prs") {
-            render_prs_dashboard(&sample_pr_groups(), true).into_string()
+            render_prs_dashboard(&sample_pr_groups(), true, Some("3m ago")).into_string()
         } else {
             let params = IndexParams {
                 tab: demo_tab,
