@@ -864,46 +864,154 @@ fn build_rows(
 
 // ── Handlers ─────────────────────────────────────────────────────
 
+/// Map from a source resource name to its human-readable `owner/repo` label.
+type Labels = BTreeMap<String, String>;
+
+/// The Jules-derived data every session tab (and the PRs tab's repo set) needs,
+/// or the reason it is currently unavailable. Built once in [`index`] so a Jules
+/// connectivity/auth failure degrades to inline notices per tab instead of a
+/// whole-page error — the topbar and tab nav always render.
+enum JulesData {
+    /// Sessions + source labels loaded successfully.
+    Available {
+        sessions: Arc<Vec<Session>>,
+        labels: Labels,
+    },
+    /// The Jules API could not be reached; `reason` is the [`JulesError`] display.
+    Unavailable { reason: String },
+}
+
+/// Fetch the Jules sessions and sources (via the short-TTL cache), collapsing
+/// either into an [`JulesData::Unavailable`] carrying the [`JulesError`] display
+/// rather than propagating a whole-page error. A Jules connectivity/auth failure
+/// therefore degrades gracefully; only a missing context hard-errors upstream.
+async fn load_jules_data(context: &WebContext) -> JulesData {
+    let sessions = match cached_sessions(context).await {
+        Ok(sessions) => sessions,
+        Err(error) => return JulesData::Unavailable { reason: error.to_string() },
+    };
+    let sources = match cached_sources(context).await {
+        Ok(sources) => sources,
+        Err(error) => return JulesData::Unavailable { reason: error.to_string() },
+    };
+    JulesData::Available {
+        sessions,
+        labels: source_labels(&sources),
+    }
+}
+
+/// Parse `JULES_PR_REPOS` — a comma-separated `owner/repo` list — into distinct
+/// `(owner, repo)` pairs, in first-seen order, skipping blank or malformed
+/// entries (missing/empty owner or repo, or extra slashes). This is the PRs-tab
+/// repo-set fallback used when Jules sources are unreachable. Pure and
+/// unit-tested.
+fn parse_pr_repos(raw: &str) -> Vec<(String, String)> {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in raw.split(',') {
+        let Some((owner, repo)) = entry.trim().split_once('/') else {
+            continue;
+        };
+        let owner = owner.trim();
+        let repo = repo.trim();
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            continue;
+        }
+        let pair = (owner.to_string(), repo.to_string());
+        if seen.insert(pair.clone()) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// The PRs-tab repo-set fallback from the `JULES_PR_REPOS` environment variable
+/// (empty when unset or entirely malformed). Used only when Jules sources are
+/// unreachable, so the GitHub PR sweep (which needs only `GITHUB_TOKEN`) can
+/// still run without Jules.
+fn pr_repos_from_env() -> Vec<(String, String)> {
+    std::env::var("JULES_PR_REPOS")
+        .ok()
+        .map(|raw| parse_pr_repos(&raw))
+        .unwrap_or_default()
+}
+
 #[get("/")]
 async fn index(Query(params): Query<IndexParams>) -> Markup {
     let Some(context) = CONTEXT.get() else {
         return render_error("dashboard context is not initialized");
     };
 
-    let sessions = match cached_sessions(context).await {
-        Ok(sessions) => sessions,
-        Err(error) => return render_error(&format!("failed to load sessions: {error}")),
-    };
-    let sources = match cached_sources(context).await {
-        Ok(sources) => sources,
-        Err(error) => return render_error(&format!("failed to load sources: {error}")),
-    };
+    let active = selected_tab(&params);
 
-    let labels = source_labels(&sources);
-
-    // The PRs tab needs async, network-fetched data — do the GitHub work only
-    // when it is the selected tab so the other tabs stay fast.
-    if selected_tab(&params) == "prs" {
-        let Some(github) = context.github.as_ref() else {
-            return render_prs_dashboard(&[], false, None);
-        };
-        let matcher = JulesMatcher::from_env();
-        let repos = distinct_repos(&labels);
-        let force = params.refresh.as_deref() == Some("1");
-        let (groups, oldest) = fetch_pr_groups(
-            Arc::clone(github),
-            Arc::clone(&context.cache),
-            &matcher,
-            repos,
-            current_unix(),
-            force,
-        )
-        .await;
-        let age = oldest.map(|at| format_age(Instant::now().duration_since(at)));
-        return render_prs_dashboard(&groups, true, age.as_deref());
+    // Tools tab has no Jules dependency — render it fully whether or not Jules is
+    // reachable, before doing any Jules work.
+    if active == "tools" {
+        return dashboard_page("tools", &render_tools(false), false);
     }
 
-    render_dashboard(&sessions, &labels, &params)
+    // Load Jules data once, degrading to an Unavailable state (never a whole-page
+    // error) on any Jules connectivity/auth failure.
+    let jules = load_jules_data(context).await;
+
+    // The PRs tab needs async, network-fetched data — do the GitHub work only
+    // when it is the selected tab so the other tabs stay fast. It is independent
+    // of Jules being up: the repo set comes from Jules sources when available,
+    // else the `JULES_PR_REPOS` env fallback, else an inline notice.
+    if active == "prs" {
+        return render_prs_tab(context, &params, &jules).await;
+    }
+
+    // Session tabs (in-progress / overview / sessions / schedule) need Jules
+    // session data. Render the tab shell with an inline unreachable panel when it
+    // is unavailable, keeping the tab nav so the user can jump to PRs/Tools.
+    match &jules {
+        JulesData::Available { sessions, labels } => render_dashboard(sessions, labels, &params),
+        JulesData::Unavailable { reason } => render_unavailable_tab(active, reason),
+    }
+}
+
+/// Render the PRs tab, sourcing the repo set from Jules sources when available
+/// and otherwise from the `JULES_PR_REPOS` env fallback. Independent of Jules
+/// being up: only `GITHUB_TOKEN` is needed to sweep PRs. Kept async here (rather
+/// than in [`render_dashboard`]) because the GitHub listing is network-fetched.
+async fn render_prs_tab(
+    context: &WebContext,
+    params: &IndexParams,
+    jules: &JulesData,
+) -> Markup {
+    // No GitHub token → the existing setup notice, regardless of Jules state.
+    let Some(github) = context.github.as_ref() else {
+        return render_prs_dashboard(&[], false, None);
+    };
+
+    // Resolve the repo set: Jules sources when available, else the env fallback.
+    let repos = match jules {
+        JulesData::Available { labels, .. } => distinct_repos(labels),
+        JulesData::Unavailable { reason } => {
+            let repos = pr_repos_from_env();
+            if repos.is_empty() {
+                // Jules is down and there is no env fallback — render the tab
+                // shell with a clear inline notice instead of PR data.
+                return render_prs_repos_unavailable(reason);
+            }
+            repos
+        }
+    };
+
+    let matcher = JulesMatcher::from_env();
+    let force = params.refresh.as_deref() == Some("1");
+    let (groups, oldest) = fetch_pr_groups(
+        Arc::clone(github),
+        Arc::clone(&context.cache),
+        &matcher,
+        repos,
+        current_unix(),
+        force,
+    )
+    .await;
+    let age = oldest.map(|at| format_age(Instant::now().duration_since(at)));
+    render_prs_dashboard(&groups, true, age.as_deref())
 }
 
 #[get("/api/summary")]
@@ -1274,6 +1382,48 @@ fn render_error(message: &str) -> Markup {
             }
         },
         true,
+    )
+}
+
+/// An inline panel — styled like the dashboard's other panels, in the same dark
+/// theme — reporting that a data source is unavailable. Rendered inside the tab
+/// shell in place of the data area so the topbar and tab nav stay usable instead
+/// of the page collapsing into a whole-page [`render_error`].
+fn inline_error_panel(title: &str, message: &str) -> Markup {
+    html! {
+        section class="panel unavailable-panel" {
+            h2 { (title) }
+            p { (message) }
+        }
+    }
+}
+
+/// Render a session tab's shell (topbar + tab nav) with an inline
+/// "Jules API unreachable: <reason>" panel in place of the data area. `reason`
+/// is the [`JulesError`] display. Auto-refresh stays on so the tab recovers
+/// automatically once Jules is reachable again.
+fn render_unavailable_tab(active: &str, reason: &str) -> Markup {
+    dashboard_page(
+        active,
+        &inline_error_panel("Jules API unreachable", reason),
+        true,
+    )
+}
+
+/// Render the PRs tab shell with an inline notice when Jules sources (the repo
+/// set) are unreachable and no `JULES_PR_REPOS` fallback is configured. No
+/// auto-refresh, matching the rest of the PRs tab.
+fn render_prs_repos_unavailable(reason: &str) -> Markup {
+    dashboard_page(
+        "prs",
+        &inline_error_panel(
+            "PR repository list unavailable",
+            &format!(
+                "Repo list comes from Jules sources, which are currently unreachable: {reason}. \
+                 Set JULES_PR_REPOS=owner/repo,... to scan without Jules."
+            ),
+        ),
+        false,
     )
 }
 
@@ -2929,6 +3079,12 @@ a:hover { text-decoration: underline; }
     padding: 24px;
 }
 .error-card h2 { margin-top: 0; color: #fca5a5; }
+.unavailable-panel {
+    background: #2a2410;
+    border-color: #4d3c12;
+}
+.unavailable-panel h2 { margin-top: 0; color: #fbbf24; }
+.unavailable-panel p { color: #fde68a; line-height: 1.5; margin: 0; }
 .kill-col { width: 34px; }
 .kill-cell { text-align: center; width: 34px; }
 .kill {
@@ -3772,6 +3928,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_pr_repos_parses_pairs_and_skips_malformed() {
+        assert_eq!(
+            parse_pr_repos("a/b, c/d ,bad,"),
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("c".to_string(), "d".to_string()),
+            ]
+        );
+        // Empty input yields nothing.
+        assert_eq!(parse_pr_repos(""), Vec::<(String, String)>::new());
+        // Empty owner/repo halves and extra slashes are rejected; duplicates are
+        // collapsed in first-seen order.
+        assert_eq!(
+            parse_pr_repos("/x, y/, too/many/slashes, acme/api, acme/api"),
+            vec![("acme".to_string(), "api".to_string())]
+        );
+    }
+
+    #[test]
+    fn session_tab_unavailable_renders_inline_panel_not_whole_page_error() {
+        let reason = "http request failed: connection refused";
+        let html = render_unavailable_tab("overview", reason).into_string();
+        // The inline unreachable panel is present with the JulesError reason.
+        assert!(html.contains("Jules API unreachable"));
+        assert!(html.contains(reason));
+        assert!(html.contains("unavailable-panel"));
+        // The tab nav still renders so the user can jump to PRs/Tools, and the
+        // whole-page error card is NOT used.
+        assert!(html.contains("/?tab=prs"));
+        assert!(html.contains("/?tab=tools"));
+        assert!(!html.contains("Could not load dashboard"));
+        // Auto-refresh stays on so the tab recovers when Jules returns.
+        assert!(html.contains(r#"http-equiv="refresh""#));
+    }
+
+    #[test]
+    fn tools_tab_renders_fully_regardless_of_jules_state() {
+        // The Tools tab has no Jules dependency, so its render is identical
+        // whether or not Jules is reachable — it never shows an unreachable panel.
+        let html = dashboard_page("tools", &render_tools(false), false).into_string();
+        assert!(html.contains("Operational tools"));
+        assert!(html.contains(r#"action="/tools/run""#));
+        assert!(!html.contains("Jules API unreachable"));
+        assert!(!html.contains("Could not load dashboard"));
+    }
+
+    #[test]
+    fn prs_tab_env_fallback_notice_when_jules_down_and_no_env() {
+        let reason = "http request failed: connection refused";
+        let html = render_prs_repos_unavailable(reason).into_string();
+        // Clear inline notice naming the env fallback and the reason.
+        assert!(html.contains("Repo list comes from Jules sources"));
+        assert!(html.contains("JULES_PR_REPOS"));
+        assert!(html.contains(reason));
+        // Tab shell still renders; not a whole-page error.
+        assert!(html.contains("/?tab=tools"));
+        assert!(!html.contains("Could not load dashboard"));
+    }
+
+    #[test]
     fn prs_tab_without_token_shows_setup_notice() {
         let html = render_prs(&[], false, None).into_string();
         assert!(html.contains("GITHUB_TOKEN"));
@@ -4361,6 +4577,24 @@ mod tests {
     #[test]
     #[ignore = "writes an HTML file for manual screenshotting"]
     fn render_demo_dashboard() {
+        // When DEMO_UNAVAILABLE is set, render the Jules-unreachable degraded
+        // state instead: a session tab (DEMO_TAB, default overview) showing the
+        // inline "Jules API unreachable" panel — never a whole-page error.
+        if std::env::var("DEMO_UNAVAILABLE").is_ok() {
+            let reason = std::env::var("DEMO_REASON").unwrap_or_else(|_| {
+                "http request failed: error sending request for url (https://jules.googleapis.com/): \
+                 connection refused"
+                    .to_string()
+            });
+            let tab = std::env::var("DEMO_TAB").unwrap_or_else(|_| "overview".to_string());
+            let html = render_unavailable_tab(&tab, &reason).into_string();
+            let out =
+                std::env::var("DEMO_OUT").unwrap_or_else(|_| "unavailable.html".to_string());
+            std::fs::write(&out, html).expect("write unavailable html");
+            eprintln!("wrote {out} · {tab} tab · Jules unavailable state");
+            return;
+        }
+
         let mut sessions: Vec<Session> = Vec::new();
         let mut push = |repo: &str, state: SessionState, ts: &str| {
             let mut s = session_repo(repo, ts);
