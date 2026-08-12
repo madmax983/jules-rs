@@ -151,6 +151,11 @@ enum CommandMode {
         id_a: String,
         id_b: String,
     },
+    #[cfg(feature = "multiverse")]
+    Multiverse {
+        id_a: String,
+        id_b: String,
+    },
     #[cfg(feature = "auditor")]
     Audit {
         session_id: String,
@@ -637,6 +642,60 @@ async fn run_inner(args: Vec<String>) -> Result<Option<String>, DirectorError> {
             let report = comparator.compare(&session_a, &activities_a, &session_b, &activities_b);
             Ok(Some(format!("{report}")))
         }
+        #[cfg(feature = "multiverse")]
+        CommandMode::Multiverse { id_a, id_b } => {
+            let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
+            let client = build_client(api_key)?;
+
+            // Fetch Session A
+            let session_a = client.get_session(&id_a).await?;
+            let mut activities_a = Vec::new();
+            let mut page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_a.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_a.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            // Fetch Session B
+            let session_b = client.get_session(&id_b).await?;
+            let mut activities_b = Vec::new();
+            page_token = None;
+            loop {
+                let response = client
+                    .list_activities(
+                        &session_b.name,
+                        ListActivitiesParams {
+                            page_size: Some(100),
+                            page_token: page_token.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                activities_b.extend(response.activities);
+                match response.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+
+            let visualizer = jules_rs::MultiverseVisualizer::new();
+            let mermaid =
+                visualizer.to_mermaid(&session_a, &activities_a, &session_b, &activities_b);
+            Ok(Some(mermaid))
+        }
         #[cfg(feature = "auditor")]
         CommandMode::Audit { session_id } => {
             let api_key = env::var("JULES_API_KEY").map_err(|_| DirectorError::MissingApiKey)?;
@@ -903,6 +962,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, DirectorErro
         }
         #[cfg(feature = "comparator")]
         "compare" => parse_compare_mode(&positional)?,
+        #[cfg(feature = "multiverse")]
+        "multiverse" => parse_multiverse_mode(&positional)?,
         #[cfg(feature = "auditor")]
         "audit" => parse_audit_mode(&positional)?,
         #[cfg(feature = "heatmap")]
@@ -1000,6 +1061,19 @@ fn parse_compare_mode(positional: &[String]) -> Result<CommandMode, DirectorErro
     })
 }
 
+#[cfg(feature = "multiverse")]
+fn parse_multiverse_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
+    if positional.len() != 3 {
+        return Err(DirectorError::Usage(
+            "multiverse requires: multiverse <session_id_a> <session_id_b>".to_string(),
+        ));
+    }
+    Ok(CommandMode::Multiverse {
+        id_a: positional[1].clone(),
+        id_b: positional[2].clone(),
+    })
+}
+
 #[cfg(feature = "auditor")]
 fn parse_audit_mode(positional: &[String]) -> Result<CommandMode, DirectorError> {
     if positional.len() != 2 {
@@ -1068,6 +1142,9 @@ fn usage() -> String {
 
     #[cfg(feature = "comparator")]
     msg.push_str("\n  director compare <session_id_a> <session_id_b> [--json]");
+
+    #[cfg(feature = "multiverse")]
+    msg.push_str("\n  director multiverse <session_id_a> <session_id_b> [--json]");
 
     #[cfg(feature = "auditor")]
     msg.push_str("\n  director audit <session_id> [--json]");

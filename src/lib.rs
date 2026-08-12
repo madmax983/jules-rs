@@ -67,6 +67,10 @@ pub use visualizer::SessionVisualizer;
 
 #[cfg(feature = "report")]
 pub use html_report::SessionHtmlReporter;
+#[cfg(feature = "multiverse")]
+mod multiverse;
+#[cfg(feature = "multiverse")]
+pub use multiverse::MultiverseVisualizer;
 
 #[cfg(feature = "narrator")]
 pub use narrator::{SessionNarrator, Story};
